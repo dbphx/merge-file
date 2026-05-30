@@ -326,6 +326,41 @@ func (r *Repository) ListJobs(ctx context.Context, actor model.User) ([]model.Jo
 	return jobs, rows.Err()
 }
 
+func (r *Repository) ListCatalogs(ctx context.Context, actor model.User) ([]model.Catalog, error) {
+	query := `
+		SELECT id, user_id, source_type, title, created_at
+		FROM catalogs
+	`
+	args := []any{}
+	if actor.Role != model.RoleAdmin {
+		query += ` WHERE user_id = $1`
+		args = append(args, actor.ID)
+	}
+	query += ` ORDER BY created_at DESC`
+
+	rows, err := r.db.Query(ctx, query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("list catalogs: %w", err)
+	}
+	defer rows.Close()
+
+	var catalogs []model.Catalog
+	for rows.Next() {
+		var catalog model.Catalog
+		if err := rows.Scan(
+			&catalog.ID,
+			&catalog.UserID,
+			&catalog.SourceType,
+			&catalog.Title,
+			&catalog.CreatedAt,
+		); err != nil {
+			return nil, fmt.Errorf("scan catalog: %w", err)
+		}
+		catalogs = append(catalogs, catalog)
+	}
+	return catalogs, rows.Err()
+}
+
 // GetJob loads a single job with its ordered source file metadata for history detail views.
 func (r *Repository) GetJob(ctx context.Context, id int64) (model.Job, error) {
 	const jobQuery = `
@@ -501,6 +536,42 @@ func (r *Repository) CreateCatalog(ctx context.Context, userID int64, sourceType
 	return catalog, nil
 }
 
+func (r *Repository) AddCatalogPage(ctx context.Context, catalogID int64, page model.CatalogPage) (model.CatalogPage, error) {
+	const insertPage = `
+		INSERT INTO catalog_pages (catalog_id, source_kind, source_name, source_order, source_size, drive_file_id, source_object_key, mime_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id, catalog_id, source_kind, source_name, source_order, source_size, drive_file_id, source_object_key, mime_type
+	`
+
+	var saved model.CatalogPage
+	if err := r.db.QueryRow(
+		ctx,
+		insertPage,
+		catalogID,
+		page.SourceKind,
+		page.SourceName,
+		page.SourceOrder,
+		page.SourceSize,
+		page.DriveFileID,
+		page.SourceObjectKey,
+		page.MimeType,
+	).Scan(
+		&saved.ID,
+		&saved.CatalogID,
+		&saved.SourceKind,
+		&saved.SourceName,
+		&saved.SourceOrder,
+		&saved.SourceSize,
+		&saved.DriveFileID,
+		&saved.SourceObjectKey,
+		&saved.MimeType,
+	); err != nil {
+		return model.CatalogPage{}, fmt.Errorf("insert catalog page: %w", err)
+	}
+
+	return saved, nil
+}
+
 func (r *Repository) GetCatalog(ctx context.Context, id int64) (model.Catalog, error) {
 	const catalogQuery = `
 		SELECT id, user_id, source_type, title, created_at
@@ -552,6 +623,7 @@ func (r *Repository) GetCatalog(ctx context.Context, id int64) (model.Catalog, e
 
 	return catalog, rows.Err()
 }
+
 
 func nullIfEmpty(value string) any {
 	if value == "" {

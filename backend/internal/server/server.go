@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -65,6 +66,11 @@ type driveCatalogRequest struct {
 	Orders map[string]int `json:"orders"`
 }
 
+type createCatalogRequest struct {
+	Title      string           `json:"title"`
+	SourceType model.SourceType `json:"sourceType"`
+}
+
 type jobDownloadState struct {
 	totalBytes          int64
 	fileBytes           map[string]int64
@@ -109,6 +115,8 @@ func New(cfg config.Config, repo *repository.Repository, authSvc auth.Service, d
 	mux.Handle("/api/merge/upload", s.withAuth(http.HandlerFunc(s.handleUploadMerge)))
 	mux.Handle("/api/catalogs/drive", s.withAuth(http.HandlerFunc(s.handleDriveCatalog)))
 	mux.Handle("/api/catalogs/upload", s.withAuth(http.HandlerFunc(s.handleUploadCatalog)))
+	mux.Handle("/api/catalogs/create", s.withAuth(http.HandlerFunc(s.handleCatalogCreate)))
+	mux.Handle("/api/catalogs", s.withAuth(http.HandlerFunc(s.handleCatalogList)))
 	mux.Handle("/api/catalogs/", s.withAuth(http.HandlerFunc(s.handleCatalogByID)))
 	mux.Handle("/api/jobs", s.withAuth(http.HandlerFunc(s.handleJobs)))
 	mux.Handle("/api/jobs/", s.withAuth(http.HandlerFunc(s.handleJobByID)))
@@ -525,6 +533,198 @@ func (s *Server) handleDriveCatalog(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, catalog)
 }
 
+func (s *Server) handleCatalogCreate(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req createCatalogRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	sourceType := model.SourceType(strings.TrimSpace(string(req.SourceType)))
+	if sourceType != model.SourceTypeDrive && sourceType != model.SourceTypeUpload {
+		writeError(w, http.StatusBadRequest, "invalid source type")
+		return
+	}
+
+	title := strings.TrimSpace(req.Title)
+	if title == "" {
+		if sourceType == model.SourceTypeDrive {
+			title = buildCatalogTitle("drive-catalog")
+		} else {
+			title = buildCatalogTitle("upload-catalog")
+		}
+	}
+
+	catalog, err := s.repo.CreateCatalog(r.Context(), currentUser(r.Context()).ID, sourceType, title, nil)
+	if err != nil {
+		log.Printf("catalog_create_failed source=%s user_id=%d err=%v", sourceType, currentUser(r.Context()).ID, err)
+		writeError(w, http.StatusInternalServerError, "failed to create catalog")
+		return
+	}
+
+	s.cacheCatalogDetail(r.Context(), catalog)
+	writeJSON(w, http.StatusCreated, catalog)
+}
+
+func (s *Server) handleCatalogUpload(w http.ResponseWriter, r *http.Request, catalogID int64) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	catalog, err := s.repo.GetCatalog(r.Context(), catalogID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "catalog not found")
+			return
+		}
+		writeError(w, http.StatusInternalServerError, "failed to load catalog")
+		return
+	}
+	if !auth.CanAccessJob(currentUser(r.Context()), catalog.UserID) {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	if catalog.SourceType != model.SourceTypeUpload {
+		writeError(w, http.StatusConflict, "catalog does not accept uploads")
+		return
+	}
+
+	orderToPage := make(map[int]model.CatalogPage, len(catalog.Pages))
+	nameToPage := make(map[string]model.CatalogPage, len(catalog.Pages))
+	for _, page := range catalog.Pages {
+		orderToPage[page.SourceOrder] = page
+		nameToPage[page.SourceName] = page
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadMB)
+	if err := r.ParseMultipartForm(s.maxUploadMB); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds %s limit", humanBytes(s.maxUploadMB)))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "failed to parse upload form")
+		return
+	}
+
+	orderPayload := r.FormValue("order")
+	order, err := strconv.Atoi(orderPayload)
+	if err != nil || order < 1 {
+		writeError(w, http.StatusBadRequest, "invalid order")
+		return
+	}
+
+	fileHeaders := r.MultipartForm.File["file"]
+	if len(fileHeaders) != 1 {
+		writeError(w, http.StatusBadRequest, "upload requires a single file")
+		return
+	}
+	fileHeader := fileHeaders[0]
+	if !merge.SupportsUploadFile(fileHeader.Filename) {
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF or PNG", fileHeader.Filename))
+		return
+	}
+
+	if existing, ok := orderToPage[order]; ok {
+		writeJSON(w, http.StatusOK, map[string]any{"skipped": true, "page": existing})
+		return
+	}
+	if existing, ok := nameToPage[fileHeader.Filename]; ok {
+		writeJSON(w, http.StatusOK, map[string]any{"skipped": true, "page": existing})
+		return
+	}
+
+	file, err := fileHeader.Open()
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to open %s", fileHeader.Filename))
+		return
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		file.Close()
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to read %s", fileHeader.Filename))
+		return
+	}
+	file.Close()
+	hash := fmt.Sprintf("%x", hasher.Sum(nil))
+
+	if s.cache != nil {
+		cacheCtx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+		key := catalogUploadCacheKey(catalog.ID, fileHeader.Filename, hash)
+		payload, ok, err := s.cache.GetBytes(cacheCtx, key)
+		cancel()
+		if err != nil {
+			log.Printf("catalog_upload_cache_get_failed catalog_id=%d file=%q err=%v", catalog.ID, fileHeader.Filename, err)
+		} else if ok && len(payload) > 0 {
+			writeJSON(w, http.StatusOK, map[string]any{"skipped": true})
+			return
+		}
+	}
+
+	workDir, err := os.MkdirTemp("", "catalog-upload-*")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create work dir")
+		return
+	}
+	defer os.RemoveAll(workDir)
+
+	localPath, size, err := saveMultipartFile(workDir, fileHeader)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to save %s", fileHeader.Filename))
+		return
+	}
+
+	objectKey := buildCatalogUploadObjectKey(currentUser(r.Context()).ID, fileHeader.Filename)
+	file, err = os.Open(localPath)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to reopen %s", fileHeader.Filename))
+		return
+	}
+	if err := s.storage.UploadObject(r.Context(), objectKey, file, size, detectContentType(fileHeader.Filename)); err != nil {
+		file.Close()
+		writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to upload %s", fileHeader.Filename))
+		return
+	}
+	file.Close()
+
+	if s.cache != nil {
+		cacheCtx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+		key := catalogUploadCacheKey(catalog.ID, fileHeader.Filename, hash)
+		if err := s.cache.SetBytes(cacheCtx, key, []byte("1"), 24*time.Hour); err != nil {
+			log.Printf("catalog_upload_cache_set_failed catalog_id=%d file=%q err=%v", catalog.ID, fileHeader.Filename, err)
+		}
+		cancel()
+	}
+
+	sizeCopy := size
+	objectKeyCopy := objectKey
+	page := model.CatalogPage{
+		SourceKind:      string(model.SourceTypeUpload),
+		SourceName:      fileHeader.Filename,
+		SourceOrder:     order,
+		SourceSize:      &sizeCopy,
+		SourceObjectKey: &objectKeyCopy,
+		MimeType:        detectContentType(fileHeader.Filename),
+	}
+	page, err = s.repo.AddCatalogPage(r.Context(), catalog.ID, page)
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to add catalog page")
+		return
+	}
+
+	if cached, ok := s.getCachedCatalogDetail(r.Context(), catalog.ID); ok {
+		cached.Pages = append(cached.Pages, page)
+		s.cacheCatalogDetail(r.Context(), cached)
+	}
+
+	writeJSON(w, http.StatusCreated, page)
+}
+
 func (s *Server) handleUploadCatalog(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
@@ -567,7 +767,6 @@ func (s *Server) handleUploadCatalog(w http.ResponseWriter, r *http.Request) {
 			writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF or PNG", header.Filename))
 			return
 		}
-
 		localPath, size, err := saveMultipartFile(workDir, header)
 		if err != nil {
 			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to save %s", header.Filename))
@@ -919,6 +1118,21 @@ func (s *Server) handleCatalogByID(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	if strings.HasSuffix(path, "/upload") {
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		if len(parts) != 2 || parts[1] != "upload" {
+			writeError(w, http.StatusNotFound, "catalog upload route not found")
+			return
+		}
+		catalogID, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid catalog id")
+			return
+		}
+		s.handleCatalogUpload(w, r, catalogID)
+		return
+	}
+
 	if strings.Contains(path, "/pages/") && strings.HasSuffix(path, "/content") {
 		parts := strings.Split(strings.Trim(path, "/"), "/")
 		if len(parts) != 4 || parts[1] != "pages" || parts[3] != "content" {
@@ -982,6 +1196,22 @@ func (s *Server) handleCatalogDetail(w http.ResponseWriter, r *http.Request, cat
 	log.Printf("catalog_detail_loaded catalog_id=%d user_id=%d page_count=%d source_type=%s", catalogID, currentUser(r.Context()).ID, len(catalog.Pages), catalog.SourceType)
 
 	writeJSON(w, http.StatusOK, catalog)
+}
+
+func (s *Server) handleCatalogList(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	catalogs, err := s.repo.ListCatalogs(r.Context(), currentUser(r.Context()))
+	if err != nil {
+		log.Printf("catalogs_list_failed user_id=%d err=%v", currentUser(r.Context()).ID, err)
+		writeError(w, http.StatusInternalServerError, "failed to list catalogs")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{"catalogs": catalogs})
 }
 
 func (s *Server) handleCatalogPageContent(w http.ResponseWriter, r *http.Request, catalogID, pageID int64) {
@@ -1590,6 +1820,24 @@ func (s *Server) cacheCatalogPageContent(ctx context.Context, catalogID int64, p
 
 func catalogPageContentCacheKey(catalogID, pageID int64) string {
 	return fmt.Sprintf("catalog:%d:page:%d:content", catalogID, pageID)
+}
+
+func catalogUploadCacheKey(catalogID int64, filename, hash string) string {
+	return fmt.Sprintf("catalog:%d:upload:%s:%s", catalogID, hash, sanitizeCacheSegment(filename))
+}
+
+func sanitizeCacheSegment(value string) string {
+	value = strings.TrimSpace(value)
+	if value == "" {
+		return "unknown"
+	}
+	value = strings.ToLower(value)
+	value = strings.ReplaceAll(value, " ", "-")
+	value = strings.ReplaceAll(value, "/", "-")
+	value = strings.ReplaceAll(value, "\\", "-")
+	value = strings.ReplaceAll(value, ":", "-")
+	value = strings.ReplaceAll(value, "..", "-")
+	return value
 }
 
 func applyDriveOrders(files []model.DrivePreviewFile, orders map[string]int) error {

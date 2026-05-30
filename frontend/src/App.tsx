@@ -1,5 +1,5 @@
 import { ChangeEvent, FormEvent, TouchEvent, useEffect, useMemo, useRef, useState } from "react";
-import type { Catalog, DrivePreviewFile, Job, UploadReviewFile, User } from "./types";
+import type { Catalog, CatalogPage, DrivePreviewFile, Job, UploadReviewFile, User } from "./types";
 
 const apiBaseURL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080/api";
 const tokenStorageKey = "merge-pdf-token";
@@ -44,6 +44,8 @@ function App() {
   const [catalogPageIndex, setCatalogPageIndex] = useState(0);
   const [isMobileCatalog, setIsMobileCatalog] = useState<boolean>(() => window.matchMedia("(max-width: 920px)").matches);
   const [catalogTurnDirection, setCatalogTurnDirection] = useState<CatalogTurnDirection>("forward");
+  const [catalogs, setCatalogs] = useState<Catalog[]>([]);
+  const [selectedCatalogID, setSelectedCatalogID] = useState<number | null>(null);
 
   const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
@@ -182,6 +184,11 @@ function App() {
       const payload = await api<{ jobs: Job[] }>("/jobs", { token });
       const nextJobs = ensureArray(payload.jobs);
       setJobs(nextJobs);
+      const catalogsPayload = await api<{ catalogs: Catalog[] }>("/catalogs", { token });
+      setCatalogs(ensureArray(catalogsPayload.catalogs));
+      if (catalogsPayload.catalogs?.length) {
+        setSelectedCatalogID((current) => current ?? catalogsPayload.catalogs[0].id);
+      }
       const runningJob = nextJobs.find((job) => job.status === "pending" || job.status === "running");
       if (runningJob) {
         setActiveJob(runningJob);
@@ -307,6 +314,12 @@ function App() {
     setCatalogPageIndex(0);
   }
 
+  function sortedOrdersUnique(files: UploadReviewFile[]): boolean {
+    const orders = files.map((item) => item.order);
+    const unique = new Set(orders);
+    return unique.size === orders.length;
+  }
+
   async function handleCreateDriveCatalog() {
     if (!sortedDriveFiles.length) {
       setError("Load Drive files before creating a catalog.");
@@ -338,31 +351,44 @@ function App() {
       setError("Choose local files before creating a catalog.");
       return;
     }
+    if (!sortedOrdersUnique(sortedUploadFiles)) {
+      setError("Catalog orders must be unique.");
+      return;
+    }
 
     setLoading(true);
     setError("");
     try {
-      const formData = new FormData();
-      const orders: Record<string, number> = {};
-      sortedUploadFiles.forEach((item) => {
-        formData.append("files", item.file);
-        orders[item.file.name] = item.order;
-      });
-      formData.append("orders", JSON.stringify(orders));
-
-      const response = await fetch(`${apiBaseURL}/catalogs/upload`, {
+      const catalog = await api<Catalog>("/catalogs/create", {
         method: "POST",
-        headers: {
-          Authorization: `Bearer ${token}`
-        },
-        body: formData
+        token,
+        body: JSON.stringify({ sourceType: "upload" })
       });
-      if (!response.ok) {
-        throw new Error(await readError(response));
+
+      for (const item of sortedUploadFiles) {
+        setNotice(`Uploading ${item.file.name}...`);
+        const formData = new FormData();
+        formData.append("file", item.file);
+        formData.append("order", String(item.order));
+        const response = await fetch(`${apiBaseURL}/catalogs/${catalog.id}/upload`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`
+          },
+          body: formData
+        });
+        if (!response.ok) {
+          throw new Error(await readError(response));
+        }
       }
-      const catalog = (await response.json()) as Catalog;
-      navigateToCatalog(catalog.id);
-      setNotice(`Catalog ${catalog.id} created.`);
+
+      const refreshed = await api<Catalog>(`/catalogs/${catalog.id}`, { token });
+      navigateToCatalog(refreshed.id);
+      replaceCatalog(createCatalogBook(refreshed));
+      const catalogsPayload = await api<{ catalogs: Catalog[] }>("/catalogs", { token });
+      setCatalogs(ensureArray(catalogsPayload.catalogs));
+      setSelectedCatalogID(refreshed.id);
+      setNotice(`Catalog ${refreshed.id} created.`);
     } catch (err) {
       setError(getErrorMessage(err));
     } finally {
@@ -376,6 +402,54 @@ function App() {
       replaceCatalog(createCatalogBook(catalog));
     } catch (err) {
       setError(getErrorMessage(err));
+    }
+  }
+
+  async function handleUploadToCatalog() {
+    if (!sortedUploadFiles.length) {
+      setError("Choose local files before uploading.");
+      return;
+    }
+    if (!selectedCatalogID) {
+      setError("Select a catalog before uploading.");
+      return;
+    }
+    if (!sortedOrdersUnique(sortedUploadFiles)) {
+      setError("Catalog orders must be unique.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    try {
+      for (const item of sortedUploadFiles) {
+        setNotice(`Uploading ${item.file.name}...`);
+        const formData = new FormData();
+        formData.append("file", item.file);
+        formData.append("order", String(item.order));
+        const response = await fetch(`${apiBaseURL}/catalogs/${selectedCatalogID}/upload`, {
+          method: "POST",
+          headers: {
+            Authorization: `Bearer ${token}`
+          },
+          body: formData
+        });
+        if (!response.ok) {
+          throw new Error(await readError(response));
+        }
+        const payload = (await response.json()) as { skipped?: boolean; page?: CatalogPage };
+        if (payload.skipped) {
+          continue;
+        }
+      }
+
+      const refreshed = await api<Catalog>(`/catalogs/${selectedCatalogID}`, { token });
+      replaceCatalog(createCatalogBook(refreshed));
+      setNotice(`Catalog ${refreshed.id} updated.`);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
     }
   }
 
@@ -831,6 +905,25 @@ function App() {
             </button>
             <button className="ghost" onClick={handleCreateUploadCatalog} disabled={loading || !uploadFiles.length}>
               Create Catalog
+            </button>
+            <div className="field">
+              <label htmlFor="catalogSelect">Add to existing catalog</label>
+              <select
+                id="catalogSelect"
+                value={selectedCatalogID ?? ""}
+                onChange={(event) => setSelectedCatalogID(event.target.value ? Number(event.target.value) : null)}
+                disabled={loading || !catalogs.length}
+              >
+                <option value="">Select catalog</option>
+                {catalogs.map((catalog) => (
+                  <option key={catalog.id} value={catalog.id}>
+                    #{catalog.id} • {catalog.title}
+                  </option>
+                ))}
+              </select>
+            </div>
+            <button className="ghost" onClick={handleUploadToCatalog} disabled={loading || !uploadFiles.length || !catalogs.length}>
+              Upload to Selected Catalog
             </button>
           </div>
           <div className="panel inset">
