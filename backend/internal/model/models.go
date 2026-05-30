@@ -93,3 +93,24 @@ type MergeFileInput struct {
 	SourceID  string
 	DriveLink string
 }
+
+type Catalog struct {
+	ID         int64         `json:"id"`
+	UserID     int64         `json:"userId"`
+	SourceType SourceType    `json:"sourceType"`
+	Title      string        `json:"title"`
+	CreatedAt  time.Time     `json:"createdAt"`
+	Pages      []CatalogPage `json:"pages,omitempty"`
+}
+
+type CatalogPage struct {
+	ID              int64   `json:"id"`
+	CatalogID       int64   `json:"catalogId"`
+	SourceKind      string  `json:"sourceKind"`
+	SourceName      string  `json:"name"`
+	SourceOrder     int     `json:"order"`
+	SourceSize      *int64  `json:"size,omitempty"`
+	DriveFileID     *string `json:"driveFileId,omitempty"`
+	SourceObjectKey *string `json:"-"`
+	MimeType        string  `json:"mimeType"`
+}

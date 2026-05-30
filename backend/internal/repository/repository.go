@@ -435,6 +435,124 @@ func (r *Repository) UpdateJobFileSourceObjectKey(ctx context.Context, jobFileID
 	return nil
 }
 
+func (r *Repository) CreateCatalog(ctx context.Context, userID int64, sourceType model.SourceType, title string, pages []model.CatalogPage) (model.Catalog, error) {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return model.Catalog{}, fmt.Errorf("begin catalog transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	const insertCatalog = `
+		INSERT INTO catalogs (user_id, source_type, title)
+		VALUES ($1, $2, $3)
+		RETURNING id, user_id, source_type, title, created_at
+	`
+
+	var catalog model.Catalog
+	if err := tx.QueryRow(ctx, insertCatalog, userID, sourceType, title).Scan(
+		&catalog.ID,
+		&catalog.UserID,
+		&catalog.SourceType,
+		&catalog.Title,
+		&catalog.CreatedAt,
+	); err != nil {
+		return model.Catalog{}, fmt.Errorf("insert catalog: %w", err)
+	}
+
+	const insertPage = `
+		INSERT INTO catalog_pages (catalog_id, source_kind, source_name, source_order, source_size, drive_file_id, source_object_key, mime_type)
+		VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+		RETURNING id, catalog_id, source_kind, source_name, source_order, source_size, drive_file_id, source_object_key, mime_type
+	`
+
+	catalog.Pages = make([]model.CatalogPage, 0, len(pages))
+	for _, page := range pages {
+		var saved model.CatalogPage
+		if err := tx.QueryRow(
+			ctx,
+			insertPage,
+			catalog.ID,
+			page.SourceKind,
+			page.SourceName,
+			page.SourceOrder,
+			page.SourceSize,
+			page.DriveFileID,
+			page.SourceObjectKey,
+			page.MimeType,
+		).Scan(
+			&saved.ID,
+			&saved.CatalogID,
+			&saved.SourceKind,
+			&saved.SourceName,
+			&saved.SourceOrder,
+			&saved.SourceSize,
+			&saved.DriveFileID,
+			&saved.SourceObjectKey,
+			&saved.MimeType,
+		); err != nil {
+			return model.Catalog{}, fmt.Errorf("insert catalog page: %w", err)
+		}
+		catalog.Pages = append(catalog.Pages, saved)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return model.Catalog{}, fmt.Errorf("commit catalog transaction: %w", err)
+	}
+	return catalog, nil
+}
+
+func (r *Repository) GetCatalog(ctx context.Context, id int64) (model.Catalog, error) {
+	const catalogQuery = `
+		SELECT id, user_id, source_type, title, created_at
+		FROM catalogs
+		WHERE id = $1
+	`
+
+	var catalog model.Catalog
+	if err := r.db.QueryRow(ctx, catalogQuery, id).Scan(
+		&catalog.ID,
+		&catalog.UserID,
+		&catalog.SourceType,
+		&catalog.Title,
+		&catalog.CreatedAt,
+	); err != nil {
+		return model.Catalog{}, err
+	}
+
+	const pagesQuery = `
+		SELECT id, catalog_id, source_kind, source_name, source_order, source_size, drive_file_id, source_object_key, mime_type
+		FROM catalog_pages
+		WHERE catalog_id = $1
+		ORDER BY source_order ASC, source_name ASC
+	`
+
+	rows, err := r.db.Query(ctx, pagesQuery, id)
+	if err != nil {
+		return model.Catalog{}, fmt.Errorf("query catalog pages: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var page model.CatalogPage
+		if err := rows.Scan(
+			&page.ID,
+			&page.CatalogID,
+			&page.SourceKind,
+			&page.SourceName,
+			&page.SourceOrder,
+			&page.SourceSize,
+			&page.DriveFileID,
+			&page.SourceObjectKey,
+			&page.MimeType,
+		); err != nil {
+			return model.Catalog{}, fmt.Errorf("scan catalog page: %w", err)
+		}
+		catalog.Pages = append(catalog.Pages, page)
+	}
+
+	return catalog, rows.Err()
+}
+
 func nullIfEmpty(value string) any {
 	if value == "" {
 		return nil

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/ml/merge-pdf/backend/internal/auth"
+	"github.com/ml/merge-pdf/backend/internal/cache"
 	"github.com/ml/merge-pdf/backend/internal/config"
 	"github.com/ml/merge-pdf/backend/internal/drive"
 	"github.com/ml/merge-pdf/backend/internal/merge"
@@ -49,10 +50,18 @@ func main() {
 		log.Fatalf("ensure storage bucket: %v", err)
 	}
 
+	redisClient := cache.New(cfg.RedisAddr, cfg.RedisPassword, cfg.RedisDB)
+	if redisClient != nil {
+		if err := redisClient.Ping(ctx); err != nil {
+			log.Printf("redis unavailable, continuing without cache: %v", err)
+			redisClient = nil
+		}
+	}
+
 	repo := repository.New(db)
 	authSvc := auth.NewService(cfg.JWTSecret)
 	driveClient := drive.NewClient(cfg.GoogleDriveAPIKey, http.DefaultClient)
-	srv := server.New(cfg, repo, authSvc, driveClient, minioClient)
+	srv := server.New(cfg, repo, authSvc, driveClient, minioClient, redisClient)
 
 	shutdownCtx, stop := signal.NotifyContext(ctx, syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

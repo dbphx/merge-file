@@ -16,7 +16,7 @@ import (
 	"github.com/ml/merge-pdf/backend/internal/model"
 )
 
-var plainFolderIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{10,}$`)
+var plainFolderIDPattern = regexp.MustCompile(`^[a-zA-Z0-9_-]{5,}$`)
 
 var orderPattern = regexp.MustCompile(`(\d+)`)
 

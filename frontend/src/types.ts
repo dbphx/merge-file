@@ -49,3 +49,23 @@ export type Job = {
   createdAt: string;
   files?: JobFile[];
 };
+
+export type CatalogPage = {
+  id: number;
+  catalogId: number;
+  sourceKind: string;
+  name: string;
+  order: number;
+  size?: number;
+  driveFileId?: string;
+  mimeType: string;
+};
+
+export type Catalog = {
+  id: number;
+  userId: number;
+  sourceType: "drive" | "upload";
+  title: string;
+  createdAt: string;
+  pages?: CatalogPage[];
+};

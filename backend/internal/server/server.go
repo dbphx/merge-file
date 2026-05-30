@@ -21,6 +21,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/ml/merge-pdf/backend/internal/auth"
+	"github.com/ml/merge-pdf/backend/internal/cache"
 	"github.com/ml/merge-pdf/backend/internal/config"
 	"github.com/ml/merge-pdf/backend/internal/drive"
 	"github.com/ml/merge-pdf/backend/internal/merge"
@@ -35,6 +36,7 @@ type Server struct {
 	auth            auth.Service
 	drive           drive.Client
 	storage         *storage.Client
+	cache           *cache.Client
 	httpServer      *http.Server
 	maxUploadMB     int64
 	allowedOrigin   string
@@ -58,6 +60,11 @@ type driveMergeRequest struct {
 	Orders map[string]int `json:"orders"`
 }
 
+type driveCatalogRequest struct {
+	URL    string         `json:"url"`
+	Orders map[string]int `json:"orders"`
+}
+
 type jobDownloadState struct {
 	totalBytes          int64
 	fileBytes           map[string]int64
@@ -67,14 +74,15 @@ type jobDownloadState struct {
 }
 
 const (
-	jobStageQueued      = "queued"
-	jobStageDownloading = "downloading"
-	jobStageMerging     = "merging"
-	jobStageUploading   = "uploading"
+	jobStageQueued           = "queued"
+	jobStageDownloading      = "downloading"
+	jobStageMerging          = "merging"
+	jobStageUploading        = "uploading"
+	catalogPageCacheMaxBytes = 10 * 1024 * 1024
 )
 
 // New wires the API surface once so every request path shares the same auth, storage, and timeout policy.
-func New(cfg config.Config, repo *repository.Repository, authSvc auth.Service, driveClient drive.Client, storageClient *storage.Client) *Server {
+func New(cfg config.Config, repo *repository.Repository, authSvc auth.Service, driveClient drive.Client, storageClient *storage.Client, cacheClient *cache.Client) *Server {
 	writeTimeout := cfg.RequestTimeout
 	if writeTimeout < 30*time.Minute {
 		writeTimeout = 30 * time.Minute
@@ -86,6 +94,7 @@ func New(cfg config.Config, repo *repository.Repository, authSvc auth.Service, d
 		auth:          authSvc,
 		drive:         driveClient,
 		storage:       storageClient,
+		cache:         cacheClient,
 		maxUploadMB:   cfg.MaxUploadBytes,
 		allowedOrigin: cfg.AllowedOrigin,
 		downloadState: make(map[int64]*jobDownloadState),
@@ -98,6 +107,9 @@ func New(cfg config.Config, repo *repository.Repository, authSvc auth.Service, d
 	mux.Handle("/api/drive/preview", s.withAuth(http.HandlerFunc(s.handleDrivePreview)))
 	mux.Handle("/api/merge/drive", s.withAuth(http.HandlerFunc(s.handleDriveMerge)))
 	mux.Handle("/api/merge/upload", s.withAuth(http.HandlerFunc(s.handleUploadMerge)))
+	mux.Handle("/api/catalogs/drive", s.withAuth(http.HandlerFunc(s.handleDriveCatalog)))
+	mux.Handle("/api/catalogs/upload", s.withAuth(http.HandlerFunc(s.handleUploadCatalog)))
+	mux.Handle("/api/catalogs/", s.withAuth(http.HandlerFunc(s.handleCatalogByID)))
 	mux.Handle("/api/jobs", s.withAuth(http.HandlerFunc(s.handleJobs)))
 	mux.Handle("/api/jobs/", s.withAuth(http.HandlerFunc(s.handleJobByID)))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -446,6 +458,158 @@ func (s *Server) handleUploadMerge(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusAccepted, job)
 }
 
+func (s *Server) handleDriveCatalog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	var req driveCatalogRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return
+	}
+
+	files, err := s.drive.PreviewFolder(r.Context(), strings.TrimSpace(req.URL))
+	if err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	if err := applyDriveOrders(files, req.Orders); err != nil {
+		writeError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+
+	userID := currentUser(r.Context()).ID
+	pages := make([]model.CatalogPage, 0, len(files))
+	for index, file := range files {
+		reader, err := s.drive.DownloadFile(r.Context(), file.SourceID)
+		if err != nil {
+			log.Printf("catalog_drive_source_download_failed user_id=%d file_index=%d file_name=%q drive_file_id=%q err=%v", userID, index+1, file.Name, file.SourceID, err)
+			writeError(w, http.StatusInternalServerError, "failed to ingest drive catalog source")
+			return
+		}
+
+		objectKey := buildCatalogDriveObjectKey(userID, file)
+		if err := s.storage.UploadObject(r.Context(), objectKey, reader, file.Size, detectContentType(file.Name)); err != nil {
+			reader.Close()
+			log.Printf("catalog_drive_source_upload_failed user_id=%d file_index=%d file_name=%q object_key=%q err=%v", userID, index+1, file.Name, objectKey, err)
+			writeError(w, http.StatusInternalServerError, "failed to ingest drive catalog source")
+			return
+		}
+		reader.Close()
+		log.Printf("catalog_drive_source_ingested user_id=%d file_index=%d file_name=%q object_key=%q size=%d", userID, index+1, file.Name, objectKey, file.Size)
+
+		sizeCopy := file.Size
+		sourceID := file.SourceID
+		objectKeyCopy := objectKey
+		pages = append(pages, model.CatalogPage{
+			SourceKind:      string(model.SourceTypeDrive),
+			SourceName:      file.Name,
+			SourceOrder:     file.ExtractedOrder,
+			SourceSize:      &sizeCopy,
+			DriveFileID:     &sourceID,
+			SourceObjectKey: &objectKeyCopy,
+			MimeType:        detectContentType(file.Name),
+		})
+	}
+
+	catalog, err := s.repo.CreateCatalog(r.Context(), userID, model.SourceTypeDrive, buildCatalogTitle("drive-catalog"), pages)
+	if err != nil {
+		log.Printf("catalog_create_failed source=drive user_id=%d err=%v", userID, err)
+		writeError(w, http.StatusInternalServerError, "failed to create catalog")
+		return
+	}
+	s.cacheCatalogDetail(r.Context(), catalog)
+
+	writeJSON(w, http.StatusCreated, catalog)
+}
+
+func (s *Server) handleUploadCatalog(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	r.Body = http.MaxBytesReader(w, r.Body, s.maxUploadMB)
+	if err := r.ParseMultipartForm(s.maxUploadMB); err != nil {
+		if strings.Contains(err.Error(), "request body too large") {
+			writeError(w, http.StatusRequestEntityTooLarge, fmt.Sprintf("upload exceeds %s limit", humanBytes(s.maxUploadMB)))
+			return
+		}
+		writeError(w, http.StatusBadRequest, "failed to parse upload form")
+		return
+	}
+
+	orderPayload := r.FormValue("orders")
+	var orders map[string]int
+	if err := json.Unmarshal([]byte(orderPayload), &orders); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid orders payload")
+		return
+	}
+
+	workDir, err := os.MkdirTemp("", "catalog-upload-*")
+	if err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to create work dir")
+		return
+	}
+	defer os.RemoveAll(workDir)
+
+	multipartFiles := r.MultipartForm.File["files"]
+	pages := make([]model.CatalogPage, 0, len(multipartFiles))
+	for _, header := range multipartFiles {
+		order, ok := orders[header.Filename]
+		if !ok {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("missing order for %s", header.Filename))
+			return
+		}
+		if !merge.SupportsUploadFile(header.Filename) {
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF or PNG", header.Filename))
+			return
+		}
+
+		localPath, size, err := saveMultipartFile(workDir, header)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to save %s", header.Filename))
+			return
+		}
+
+		objectKey := buildCatalogUploadObjectKey(currentUser(r.Context()).ID, header.Filename)
+		file, err := os.Open(localPath)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to reopen %s", header.Filename))
+			return
+		}
+		if err := s.storage.UploadObject(r.Context(), objectKey, file, size, detectContentType(header.Filename)); err != nil {
+			file.Close()
+			writeError(w, http.StatusInternalServerError, fmt.Sprintf("failed to upload %s", header.Filename))
+			return
+		}
+		file.Close()
+
+		sizeCopy := size
+		objectKeyCopy := objectKey
+		pages = append(pages, model.CatalogPage{
+			SourceKind:      string(model.SourceTypeUpload),
+			SourceName:      header.Filename,
+			SourceOrder:     order,
+			SourceSize:      &sizeCopy,
+			SourceObjectKey: &objectKeyCopy,
+			MimeType:        detectContentType(header.Filename),
+		})
+	}
+
+	catalog, err := s.repo.CreateCatalog(r.Context(), currentUser(r.Context()).ID, model.SourceTypeUpload, buildCatalogTitle("upload-catalog"), pages)
+	if err != nil {
+		log.Printf("catalog_create_failed source=upload user_id=%d err=%v", currentUser(r.Context()).ID, err)
+		writeError(w, http.StatusInternalServerError, "failed to create catalog")
+		return
+	}
+	s.cacheCatalogDetail(r.Context(), catalog)
+
+	writeJSON(w, http.StatusCreated, catalog)
+}
+
 func (s *Server) processUploadMerge(jobID int64, workDir, outputName string, inputs []model.MergeFileInput) {
 	log.Printf("job=%d source=upload event=started total_files=%d", jobID, len(inputs))
 	defer os.RemoveAll(workDir)
@@ -746,6 +910,183 @@ func (s *Server) handleJobs(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"jobs": jobs})
+}
+
+func (s *Server) handleCatalogByID(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/catalogs/")
+	if path == "" {
+		writeError(w, http.StatusNotFound, "catalog route not found")
+		return
+	}
+
+	if strings.Contains(path, "/pages/") && strings.HasSuffix(path, "/content") {
+		parts := strings.Split(strings.Trim(path, "/"), "/")
+		if len(parts) != 4 || parts[1] != "pages" || parts[3] != "content" {
+			writeError(w, http.StatusNotFound, "catalog page route not found")
+			return
+		}
+		catalogID, err := strconv.ParseInt(parts[0], 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid catalog id")
+			return
+		}
+		pageID, err := strconv.ParseInt(parts[2], 10, 64)
+		if err != nil {
+			writeError(w, http.StatusBadRequest, "invalid catalog page id")
+			return
+		}
+		s.handleCatalogPageContent(w, r, catalogID, pageID)
+		return
+	}
+
+	catalogID, err := strconv.ParseInt(strings.TrimSuffix(path, "/"), 10, 64)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid catalog id")
+		return
+	}
+
+	switch r.Method {
+	case http.MethodGet:
+		s.handleCatalogDetail(w, r, catalogID)
+	default:
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+	}
+}
+
+func (s *Server) handleCatalogDetail(w http.ResponseWriter, r *http.Request, catalogID int64) {
+	if catalog, ok := s.getCachedCatalogDetail(r.Context(), catalogID); ok {
+		if auth.CanAccessJob(currentUser(r.Context()), catalog.UserID) {
+			log.Printf("catalog_detail_cache_hit catalog_id=%d user_id=%d page_count=%d", catalogID, currentUser(r.Context()).ID, len(catalog.Pages))
+			writeJSON(w, http.StatusOK, catalog)
+			return
+		}
+	}
+
+	catalog, err := s.repo.GetCatalog(r.Context(), catalogID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("catalog_detail_not_found catalog_id=%d user_id=%d", catalogID, currentUser(r.Context()).ID)
+			writeError(w, http.StatusNotFound, "catalog not found")
+			return
+		}
+		log.Printf("catalog_detail_load_failed catalog_id=%d user_id=%d err=%v", catalogID, currentUser(r.Context()).ID, err)
+		writeError(w, http.StatusInternalServerError, "failed to load catalog")
+		return
+	}
+	if !auth.CanAccessJob(currentUser(r.Context()), catalog.UserID) {
+		log.Printf("catalog_detail_forbidden catalog_id=%d actor_user_id=%d owner_user_id=%d", catalogID, currentUser(r.Context()).ID, catalog.UserID)
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+	s.cacheCatalogDetail(r.Context(), catalog)
+	log.Printf("catalog_detail_loaded catalog_id=%d user_id=%d page_count=%d source_type=%s", catalogID, currentUser(r.Context()).ID, len(catalog.Pages), catalog.SourceType)
+
+	writeJSON(w, http.StatusOK, catalog)
+}
+
+func (s *Server) handleCatalogPageContent(w http.ResponseWriter, r *http.Request, catalogID, pageID int64) {
+	catalog, err := s.repo.GetCatalog(r.Context(), catalogID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			log.Printf("catalog_page_catalog_not_found catalog_id=%d page_id=%d user_id=%d", catalogID, pageID, currentUser(r.Context()).ID)
+			writeError(w, http.StatusNotFound, "catalog not found")
+			return
+		}
+		log.Printf("catalog_page_catalog_load_failed catalog_id=%d page_id=%d user_id=%d err=%v", catalogID, pageID, currentUser(r.Context()).ID, err)
+		writeError(w, http.StatusInternalServerError, "failed to load catalog")
+		return
+	}
+	if !auth.CanAccessJob(currentUser(r.Context()), catalog.UserID) {
+		log.Printf("catalog_page_forbidden catalog_id=%d page_id=%d actor_user_id=%d owner_user_id=%d", catalogID, pageID, currentUser(r.Context()).ID, catalog.UserID)
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	for _, page := range catalog.Pages {
+		if page.ID != pageID {
+			continue
+		}
+		w.Header().Set("Content-Type", page.MimeType)
+		w.Header().Set("Content-Disposition", fmt.Sprintf("inline; filename=%q", page.SourceName))
+
+		if payload, ok := s.getCachedCatalogPageContent(r.Context(), catalogID, page); ok {
+			log.Printf("catalog_page_cache_hit catalog_id=%d page_id=%d bytes=%d", catalogID, page.ID, len(payload))
+			w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+			_, _ = w.Write(payload)
+			return
+		}
+
+		if page.SourceObjectKey != nil && *page.SourceObjectKey != "" {
+			object, err := s.storage.Download(r.Context(), *page.SourceObjectKey)
+			if err != nil {
+				log.Printf("catalog_page_storage_download_failed catalog_id=%d page_id=%d object_key=%q err=%v", catalogID, page.ID, *page.SourceObjectKey, err)
+				writeError(w, http.StatusInternalServerError, "failed to load catalog page")
+				return
+			}
+			defer object.Close()
+
+			info, err := object.Stat()
+			if err != nil {
+				log.Printf("catalog_page_storage_stat_failed catalog_id=%d page_id=%d object_key=%q err=%v", catalogID, page.ID, *page.SourceObjectKey, err)
+				writeError(w, http.StatusInternalServerError, "failed to stat catalog page")
+				return
+			}
+			if info.Size <= catalogPageCacheMaxBytes {
+				payload, err := io.ReadAll(io.LimitReader(object, catalogPageCacheMaxBytes+1))
+				if err != nil {
+					log.Printf("catalog_page_storage_read_failed catalog_id=%d page_id=%d object_key=%q err=%v", catalogID, page.ID, *page.SourceObjectKey, err)
+					writeError(w, http.StatusInternalServerError, "failed to read catalog page")
+					return
+				}
+				s.cacheCatalogPageContent(r.Context(), catalogID, page, payload)
+				log.Printf("catalog_page_served source=storage catalog_id=%d page_id=%d bytes=%d cached=true", catalogID, page.ID, len(payload))
+				w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+				_, _ = w.Write(payload)
+				return
+			}
+			w.Header().Set("Content-Length", strconv.FormatInt(info.Size, 10))
+			log.Printf("catalog_page_served source=storage catalog_id=%d page_id=%d bytes=%d cached=false", catalogID, page.ID, info.Size)
+			io.Copy(w, object)
+			return
+		}
+
+		if page.DriveFileID != nil && *page.DriveFileID != "" {
+			reader, err := s.drive.DownloadFile(r.Context(), *page.DriveFileID)
+			if err != nil {
+				log.Printf("catalog_page_drive_download_failed catalog_id=%d page_id=%d drive_file_id=%q err=%v", catalogID, page.ID, *page.DriveFileID, err)
+				writeError(w, http.StatusInternalServerError, "failed to load catalog page")
+				return
+			}
+			defer reader.Close()
+			if page.SourceSize != nil && *page.SourceSize <= catalogPageCacheMaxBytes {
+				payload, err := io.ReadAll(io.LimitReader(reader, catalogPageCacheMaxBytes+1))
+				if err != nil {
+					log.Printf("catalog_page_drive_read_failed catalog_id=%d page_id=%d drive_file_id=%q err=%v", catalogID, page.ID, *page.DriveFileID, err)
+					writeError(w, http.StatusInternalServerError, "failed to read catalog page")
+					return
+				}
+				s.cacheCatalogPageContent(r.Context(), catalogID, page, payload)
+				log.Printf("catalog_page_served source=drive catalog_id=%d page_id=%d bytes=%d cached=true", catalogID, page.ID, len(payload))
+				w.Header().Set("Content-Length", strconv.Itoa(len(payload)))
+				_, _ = w.Write(payload)
+				return
+			}
+			sizeLabel := int64(-1)
+			if page.SourceSize != nil {
+				sizeLabel = *page.SourceSize
+			}
+			log.Printf("catalog_page_served source=drive catalog_id=%d page_id=%d bytes=%d cached=false", catalogID, page.ID, sizeLabel)
+			io.Copy(w, reader)
+			return
+		}
+
+		log.Printf("catalog_page_missing_source catalog_id=%d page_id=%d source_name=%q", catalogID, page.ID, page.SourceName)
+		writeError(w, http.StatusConflict, "catalog page has no stored content")
+		return
+	}
+
+	log.Printf("catalog_page_not_found catalog_id=%d page_id=%d user_id=%d", catalogID, pageID, currentUser(r.Context()).ID)
+	writeError(w, http.StatusNotFound, "catalog page not found")
 }
 
 func (s *Server) handleJobByID(w http.ResponseWriter, r *http.Request) {
@@ -1154,8 +1495,24 @@ func buildOutputFilename(prefix string) string {
 	return fmt.Sprintf("%s-%s.pdf", prefix, time.Now().Format("02-01-2006_15-04"))
 }
 
+func buildCatalogTitle(prefix string) string {
+	return fmt.Sprintf("%s-%s", prefix, time.Now().Format("02-01-2006_15-04"))
+}
+
 func buildSourceCacheObjectKey(jobID int64, file model.DrivePreviewFile) string {
 	return fmt.Sprintf("source-cache/jobs/%d/%s-%s%s", jobID, file.SourceID, sanitizeFilename(strings.TrimSuffix(file.Name, filepath.Ext(file.Name))), strings.ToLower(filepath.Ext(file.Name)))
+}
+
+func buildCatalogUploadObjectKey(userID int64, filename string) string {
+	extension := strings.ToLower(filepath.Ext(filename))
+	base := sanitizeFilename(strings.TrimSuffix(filename, filepath.Ext(filename)))
+	return fmt.Sprintf("catalogs/%d/%d-%s%s", userID, time.Now().UnixNano(), base, extension)
+}
+
+func buildCatalogDriveObjectKey(userID int64, file model.DrivePreviewFile) string {
+	extension := strings.ToLower(filepath.Ext(file.Name))
+	base := sanitizeFilename(strings.TrimSuffix(file.Name, filepath.Ext(file.Name)))
+	return fmt.Sprintf("catalogs/%d/drive/%s-%s%s", userID, file.SourceID, base, extension)
 }
 
 func detectContentType(path string) string {
@@ -1164,6 +1521,75 @@ func detectContentType(path string) string {
 		return "application/octet-stream"
 	}
 	return contentType
+}
+
+func (s *Server) getCachedCatalogDetail(ctx context.Context, catalogID int64) (model.Catalog, bool) {
+	if s.cache == nil {
+		return model.Catalog{}, false
+	}
+
+	cacheCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	var catalog model.Catalog
+	ok, err := s.cache.GetJSON(cacheCtx, catalogDetailCacheKey(catalogID), &catalog)
+	if err != nil {
+		log.Printf("catalog_cache_get_failed catalog_id=%d err=%v", catalogID, err)
+		return model.Catalog{}, false
+	}
+	return catalog, ok
+}
+
+func (s *Server) cacheCatalogDetail(ctx context.Context, catalog model.Catalog) {
+	if s.cache == nil {
+		return
+	}
+
+	cacheCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	if err := s.cache.SetJSON(cacheCtx, catalogDetailCacheKey(catalog.ID), catalog, 15*time.Minute); err != nil {
+		log.Printf("catalog_cache_set_failed catalog_id=%d err=%v", catalog.ID, err)
+	}
+}
+
+func catalogDetailCacheKey(catalogID int64) string {
+	return fmt.Sprintf("catalog:%d:detail", catalogID)
+}
+
+func (s *Server) getCachedCatalogPageContent(ctx context.Context, catalogID int64, page model.CatalogPage) ([]byte, bool) {
+	if s.cache == nil {
+		return nil, false
+	}
+
+	cacheCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	payload, ok, err := s.cache.GetBytes(cacheCtx, catalogPageContentCacheKey(catalogID, page.ID))
+	if err != nil {
+		log.Printf("catalog_page_cache_get_failed catalog_id=%d page_id=%d err=%v", catalogID, page.ID, err)
+		return nil, false
+	}
+	return payload, ok
+}
+
+func (s *Server) cacheCatalogPageContent(ctx context.Context, catalogID int64, page model.CatalogPage, payload []byte) {
+	if s.cache == nil || len(payload) > catalogPageCacheMaxBytes {
+		return
+	}
+
+	cacheCtx, cancel := context.WithTimeout(ctx, 500*time.Millisecond)
+	defer cancel()
+
+	if err := s.cache.SetBytes(cacheCtx, catalogPageContentCacheKey(catalogID, page.ID), payload, 24*time.Hour); err != nil {
+		log.Printf("catalog_page_cache_set_failed catalog_id=%d page_id=%d err=%v", catalogID, page.ID, err)
+		return
+	}
+	log.Printf("catalog_page_cache_store catalog_id=%d page_id=%d bytes=%d", catalogID, page.ID, len(payload))
+}
+
+func catalogPageContentCacheKey(catalogID, pageID int64) string {
+	return fmt.Sprintf("catalog:%d:page:%d:content", catalogID, pageID)
 }
 
 func applyDriveOrders(files []model.DrivePreviewFile, orders map[string]int) error {

@@ -84,6 +84,30 @@ input {
   overflow: hidden;
 }
 
+.catalog-shell {
+  width: 100vw;
+  min-height: 100vh;
+  height: 100vh;
+  padding: 1rem;
+  overflow: hidden;
+}
+
+.catalog-shell-reader {
+  position: relative;
+  padding: 0;
+  background:
+    radial-gradient(circle at top left, rgba(178, 85, 47, 0.14), transparent 26%),
+    radial-gradient(circle at bottom right, rgba(44, 90, 68, 0.14), transparent 28%),
+    linear-gradient(145deg, #f2eadc 0%, #e5d7c4 100%);
+}
+
+.catalog-reader-stage {
+  width: 100%;
+  height: 100%;
+  padding: 0;
+  margin: 0;
+}
+
 .shell-login {
   display: grid;
   grid-template-columns: 1.2fr 0.9fr;
@@ -385,6 +409,247 @@ th {
   min-height: 0;
 }
 
+.catalog-layout {
+  display: grid;
+  grid-template-columns: 3fr 7fr;
+  gap: 1rem;
+  flex: 1;
+  min-height: 0;
+}
+
+.catalog-layout-fullscreen {
+  height: calc(100vh - 2rem);
+}
+
+.catalog-reader-stage {
+  width: 100%;
+  height: 100%;
+}
+
+.catalog-nav {
+  position: absolute;
+  top: 50%;
+  z-index: 40;
+  transform: translateY(-50%);
+  min-width: 96px;
+  padding-inline: 1.2rem;
+  background: rgba(31, 45, 35, 0.88);
+  color: white;
+  box-shadow: 0 18px 44px rgba(42, 30, 18, 0.18);
+}
+
+.catalog-nav-prev {
+  left: 1rem;
+}
+
+.catalog-nav-next {
+  right: 1rem;
+}
+
+.catalog-sidebar,
+.catalog-stage-panel {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+
+.catalog-page-list {
+  list-style: none;
+  padding: 0;
+  margin: 0;
+  display: grid;
+  gap: 0.7rem;
+}
+
+.catalog-page-jump {
+  width: 100%;
+  text-align: left;
+  border-radius: 18px;
+  padding: 0.9rem 1rem;
+  display: grid;
+  grid-template-columns: 2rem 1fr;
+  gap: 0.8rem;
+  align-items: center;
+  background: rgba(255, 255, 255, 0.62);
+  color: var(--ink);
+  border: 1px solid var(--line);
+}
+
+.catalog-page-jump.active {
+  background: var(--ink);
+  color: white;
+}
+
+.catalog-page-jump span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.catalog-stage {
+  flex: 1;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  perspective: 2200px;
+  padding: 0 2.75rem;
+  overflow: hidden;
+}
+
+.catalog-book {
+  position: relative;
+  width: min(100%, 1380px);
+  height: 100%;
+  max-height: 100%;
+  min-height: 0;
+  transform-style: preserve-3d;
+}
+
+.catalog-spread {
+  width: 100%;
+  height: 100%;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  align-items: stretch;
+  position: relative;
+}
+
+.catalog-spread.mobile {
+  grid-template-columns: 1fr;
+}
+
+.catalog-spread.turn-forward {
+  animation: catalogSpreadForward 520ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.catalog-spread.turn-backward {
+  animation: catalogSpreadBackward 520ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+
+.catalog-sheet {
+  position: relative;
+  min-width: 0;
+  min-height: 0;
+  padding: 0.35rem;
+}
+
+.catalog-sheet-static {
+  height: 100%;
+}
+
+.catalog-sheet-static.verso {
+  transform: perspective(1600px) rotateY(6deg);
+}
+
+.catalog-sheet-static:not(.verso) {
+  transform: perspective(1600px) rotateY(-6deg);
+}
+
+.catalog-sheet-face {
+  position: relative;
+  width: 93%;
+  height: 93%;
+  margin: auto;
+  border-radius: 0;
+  overflow: hidden;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.95), rgba(250, 243, 232, 0.96)),
+    linear-gradient(90deg, rgba(31, 45, 35, 0.06), transparent 8%, transparent 92%, rgba(31, 45, 35, 0.06));
+  border: 1px solid rgba(117, 88, 55, 0.14);
+  box-shadow: 0 20px 44px rgba(42, 30, 18, 0.1);
+}
+
+.catalog-sheet-front {
+  display: block;
+  height: 100%;
+}
+
+.catalog-sheet-body {
+  padding: 0;
+  height: 100%;
+  min-height: 0;
+  display: grid;
+  place-items: center;
+  overflow: hidden;
+}
+
+.catalog-sheet-body img,
+.catalog-sheet-body object,
+.catalog-sheet-body iframe {
+  width: auto;
+  height: auto;
+  max-width: 92%;
+  max-height: 92%;
+  border: 1px solid rgba(117, 88, 55, 0.18);
+  border-radius: 12px;
+  background: white;
+  display: block;
+  box-shadow: 0 18px 40px rgba(42, 30, 18, 0.12);
+}
+
+.catalog-sheet-body img {
+  object-fit: contain;
+}
+
+.catalog-sheet-body object {
+  width: 100%;
+  height: 100%;
+}
+
+.catalog-page-loading {
+  width: 100%;
+  height: 100%;
+  max-width: 92%;
+  max-height: 92%;
+  border-radius: 12px;
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(120deg, rgba(255, 255, 255, 0.82), rgba(245, 237, 225, 0.96)),
+    repeating-linear-gradient(135deg, rgba(31, 45, 35, 0.03) 0 12px, rgba(31, 45, 35, 0.06) 12px 24px);
+  color: var(--muted);
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  border: 1px solid rgba(117, 88, 55, 0.18);
+  box-shadow: 0 18px 40px rgba(42, 30, 18, 0.12);
+}
+
+.catalog-empty {
+  flex: 1;
+  display: grid;
+  place-items: center;
+  text-align: center;
+  color: var(--muted);
+  padding: 2rem;
+}
+
+.catalog-empty-plain {
+  min-height: 100vh;
+}
+
+@keyframes catalogSpreadForward {
+  0% {
+    transform: rotateY(-14deg) translateX(18px) scale(.985);
+    opacity: .88;
+  }
+  100% {
+    transform: rotateY(0deg) translateX(0) scale(1);
+    opacity: 1;
+  }
+}
+
+@keyframes catalogSpreadBackward {
+  0% {
+    transform: rotateY(14deg) translateX(-18px) scale(.985);
+    opacity: .88;
+  }
+  100% {
+    transform: rotateY(0deg) translateX(0) scale(1);
+    opacity: 1;
+  }
+}
+
 .history-list {
   list-style: none;
   padding: 0;
@@ -482,9 +747,20 @@ th {
     overflow: visible;
   }
 
+  .catalog-shell {
+    height: auto;
+    min-height: 100vh;
+    overflow: visible;
+  }
+
+  .catalog-shell-reader {
+    padding: 0;
+  }
+
   .shell-login,
   .grid,
-  .history-layout {
+  .history-layout,
+  .catalog-layout {
     grid-template-columns: 1fr;
   }
 
@@ -492,5 +768,36 @@ th {
   .tabs {
     flex-direction: column;
     align-items: stretch;
+  }
+
+  .catalog-book {
+    min-height: 500px;
+  }
+
+  .catalog-spread {
+    grid-template-columns: 1fr;
+  }
+
+  .catalog-sheet-static.verso,
+  .catalog-sheet-static:not(.verso) {
+    transform: none;
+  }
+
+  .catalog-stage {
+    padding: 3.5rem 0 4.5rem;
+  }
+
+  .catalog-nav {
+    top: auto;
+    bottom: 1rem;
+    transform: none;
+  }
+
+  .catalog-nav-prev {
+    left: 1rem;
+  }
+
+  .catalog-nav-next {
+    right: 1rem;
   }
 }

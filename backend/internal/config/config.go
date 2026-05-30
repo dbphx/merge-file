@@ -24,6 +24,9 @@ type Config struct {
 	MinIOBucket       string
 	MinIOUseSSL       bool
 	AllowedOrigin     string
+	RedisAddr         string
+	RedisPassword     string
+	RedisDB           int
 }
 
 // Load centralizes runtime configuration so local dev and production boot the same way.
@@ -45,6 +48,11 @@ func Load() (Config, error) {
 		return Config{}, fmt.Errorf("parse MINIO_USE_SSL: %w", err)
 	}
 
+	redisDB, err := strconv.Atoi(envOrDefault("REDIS_DB", "0"))
+	if err != nil {
+		return Config{}, fmt.Errorf("parse REDIS_DB: %w", err)
+	}
+
 	cfg := Config{
 		Port:              port,
 		PublicURL:         publicURL,
@@ -59,6 +67,9 @@ func Load() (Config, error) {
 		MinIOBucket:       envOrDefault("MINIO_BUCKET", "merged-pdfs"),
 		MinIOUseSSL:       minioSSL,
 		AllowedOrigin:     envOrDefault("ALLOWED_ORIGIN", "http://localhost:5173"),
+		RedisAddr:         os.Getenv("REDIS_ADDR"),
+		RedisPassword:     os.Getenv("REDIS_PASSWORD"),
+		RedisDB:           redisDB,
 	}
 
 	if cfg.JWTSecret == "" {

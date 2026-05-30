@@ -1,17 +1,36 @@
-import { ChangeEvent, FormEvent, useEffect, useMemo, useRef, useState } from "react";
-import type { DrivePreviewFile, Job, UploadReviewFile, User } from "./types";
+import { ChangeEvent, FormEvent, TouchEvent, useEffect, useMemo, useRef, useState } from "react";
+import type { Catalog, DrivePreviewFile, Job, UploadReviewFile, User } from "./types";
 
 const apiBaseURL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080/api";
 const tokenStorageKey = "merge-pdf-token";
-type TabKey = "drive" | "upload" | "history";
+type TabKey = "drive" | "upload" | "history" | "catalog";
 const uploadAccept = "application/pdf,image/png,.pdf,.png";
+const catalogChunkSize = 3;
+
+type CatalogBookPage = {
+  id: string;
+  title: string;
+  subtitle: string;
+  source: string | null;
+  kind: "image" | "document";
+};
+
+type CatalogBook = {
+  id: number;
+  title: string;
+  sourceLabel: string;
+  pages: CatalogBookPage[];
+};
+
+type CatalogTurnDirection = "forward" | "backward";
 
 function App() {
   const [token, setToken] = useState<string>(() => localStorage.getItem(tokenStorageKey) ?? "");
   const [user, setUser] = useState<User | null>(null);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const [activeTab, setActiveTab] = useState<TabKey>(() => getTabFromHash(window.location.hash));
+  const [activeTab, setActiveTab] = useState<TabKey>(() => getRouteState(window.location).tab);
+  const [catalogRouteID, setCatalogRouteID] = useState<number | null>(() => getRouteState(window.location).catalogID);
   const [loading, setLoading] = useState(false);
 
   const [loginEmail, setLoginEmail] = useState("user@example.com");
@@ -21,12 +40,21 @@ function App() {
   const [driveFiles, setDriveFiles] = useState<DrivePreviewFile[]>([]);
 
   const [uploadFiles, setUploadFiles] = useState<UploadReviewFile[]>([]);
+  const [catalogBook, setCatalogBook] = useState<CatalogBook | null>(null);
+  const [catalogPageIndex, setCatalogPageIndex] = useState(0);
+  const [isMobileCatalog, setIsMobileCatalog] = useState<boolean>(() => window.matchMedia("(max-width: 920px)").matches);
+  const [catalogTurnDirection, setCatalogTurnDirection] = useState<CatalogTurnDirection>("forward");
 
   const [jobs, setJobs] = useState<Job[]>([]);
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [activeJob, setActiveJob] = useState<Job | null>(null);
   const [downloadSpeedBps, setDownloadSpeedBps] = useState<number | null>(null);
   const downloadSampleRef = useRef<{ fileName: string; bytes: number; timestamp: number } | null>(null);
+  const catalogObjectURLsRef = useRef<string[]>([]);
+  const catalogTouchStartXRef = useRef<number | null>(null);
+  const loadingCatalogPageIDsRef = useRef<Set<string>>(new Set());
+  const loadedCatalogChunkStartsRef = useRef<Set<number>>(new Set());
+  const loadingCatalogChunkStartsRef = useRef<Set<number>>(new Set());
 
   useEffect(() => {
     if (!token) {
@@ -40,13 +68,19 @@ function App() {
   }, [token]);
 
   useEffect(() => {
-    function syncTabFromHash() {
-      setActiveTab(getTabFromHash(window.location.hash));
+    function syncRouteFromLocation() {
+      const route = getRouteState(window.location);
+      setActiveTab(route.tab);
+      setCatalogRouteID(route.catalogID);
     }
 
-    window.addEventListener("hashchange", syncTabFromHash);
-    syncTabFromHash();
-    return () => window.removeEventListener("hashchange", syncTabFromHash);
+    window.addEventListener("hashchange", syncRouteFromLocation);
+    window.addEventListener("popstate", syncRouteFromLocation);
+    syncRouteFromLocation();
+    return () => {
+      window.removeEventListener("hashchange", syncRouteFromLocation);
+      window.removeEventListener("popstate", syncRouteFromLocation);
+    };
   }, []);
 
   useEffect(() => {
@@ -60,12 +94,6 @@ function App() {
 
     return () => window.clearInterval(interval);
   }, [token, activeJob]);
-
-  useEffect(() => {
-    if (window.location.hash !== tabToHash(activeTab)) {
-      window.history.replaceState(null, "", tabToHash(activeTab));
-    }
-  }, [activeTab]);
 
   useEffect(() => {
     if (!activeJob || activeJob.currentStage !== "downloading" || !activeJob.currentFileName) {
@@ -92,6 +120,51 @@ function App() {
       timestamp: now
     };
   }, [activeJob]);
+
+  useEffect(() => {
+    return () => {
+      revokeCatalogObjectURLs(catalogObjectURLsRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    const media = window.matchMedia("(max-width: 920px)");
+    const syncMobileCatalog = () => setIsMobileCatalog(media.matches);
+    syncMobileCatalog();
+    media.addEventListener("change", syncMobileCatalog);
+    return () => media.removeEventListener("change", syncMobileCatalog);
+  }, []);
+
+  useEffect(() => {
+    if (!token || !catalogRouteID) {
+      return;
+    }
+    void loadCatalog(catalogRouteID);
+  }, [token, catalogRouteID]);
+
+  useEffect(() => {
+    if (!token || !catalogBook) {
+      return;
+    }
+
+    let cancelled = false;
+    const currentChunkStart = Math.floor(catalogPageIndex / catalogChunkSize) * catalogChunkSize;
+    void (async () => {
+      await loadCatalogChunk(catalogBook.id, currentChunkStart);
+      if (cancelled) {
+        return;
+      }
+
+      const nextChunkStart = currentChunkStart + catalogChunkSize;
+      if (nextChunkStart < catalogBook.pages.length) {
+        await loadCatalogChunk(catalogBook.id, nextChunkStart);
+      }
+    })();
+
+    return () => {
+      cancelled = true;
+    };
+  }, [token, catalogBook, catalogPageIndex]);
 
   const sortedUploadFiles = useMemo(
     () => [...uploadFiles].sort((a, b) => a.order - b.order || a.file.name.localeCompare(b.file.name)),
@@ -221,6 +294,138 @@ function App() {
       setError(getErrorMessage(err));
     } finally {
       setLoading(false);
+    }
+  }
+
+  function replaceCatalog(nextCatalog: CatalogBook, objectURLs: string[] = []) {
+    revokeCatalogObjectURLs(catalogObjectURLsRef.current);
+    catalogObjectURLsRef.current = objectURLs;
+    loadingCatalogPageIDsRef.current.clear();
+    loadedCatalogChunkStartsRef.current.clear();
+    loadingCatalogChunkStartsRef.current.clear();
+    setCatalogBook(nextCatalog);
+    setCatalogPageIndex(0);
+  }
+
+  async function handleCreateDriveCatalog() {
+    if (!sortedDriveFiles.length) {
+      setError("Load Drive files before creating a catalog.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    try {
+      const catalog = await api<Catalog>("/catalogs/drive", {
+        method: "POST",
+        token,
+        body: JSON.stringify({
+          url: driveURL,
+          orders: Object.fromEntries(sortedDriveFiles.map((file, index) => [file.sourceId, index + 1]))
+        })
+      });
+      navigateToCatalog(catalog.id);
+      setNotice(`Catalog ${catalog.id} created.`);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function handleCreateUploadCatalog() {
+    if (!sortedUploadFiles.length) {
+      setError("Choose local files before creating a catalog.");
+      return;
+    }
+
+    setLoading(true);
+    setError("");
+    try {
+      const formData = new FormData();
+      const orders: Record<string, number> = {};
+      sortedUploadFiles.forEach((item) => {
+        formData.append("files", item.file);
+        orders[item.file.name] = item.order;
+      });
+      formData.append("orders", JSON.stringify(orders));
+
+      const response = await fetch(`${apiBaseURL}/catalogs/upload`, {
+        method: "POST",
+        headers: {
+          Authorization: `Bearer ${token}`
+        },
+        body: formData
+      });
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+      const catalog = (await response.json()) as Catalog;
+      navigateToCatalog(catalog.id);
+      setNotice(`Catalog ${catalog.id} created.`);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadCatalog(catalogID: number) {
+    try {
+      const catalog = await api<Catalog>(`/catalogs/${catalogID}`, { token });
+      replaceCatalog(createCatalogBook(catalog));
+    } catch (err) {
+      setError(getErrorMessage(err));
+    }
+  }
+
+  async function loadCatalogChunk(catalogID: number, startIndex: number) {
+    if (!token) {
+      return;
+    }
+    if (loadedCatalogChunkStartsRef.current.has(startIndex) || loadingCatalogChunkStartsRef.current.has(startIndex)) {
+      return;
+    }
+
+    const snapshot = catalogBook;
+    if (!snapshot || snapshot.id !== catalogID) {
+      return;
+    }
+
+    const chunk = snapshot.pages.slice(startIndex, startIndex + catalogChunkSize);
+    const pendingPages = chunk.filter((page) => !page.source && !loadingCatalogPageIDsRef.current.has(page.id));
+    if (!pendingPages.length) {
+      loadedCatalogChunkStartsRef.current.add(startIndex);
+      return;
+    }
+
+    loadingCatalogChunkStartsRef.current.add(startIndex);
+    pendingPages.forEach((page) => loadingCatalogPageIDsRef.current.add(page.id));
+    try {
+      const objectURLs: string[] = [];
+      const loadedPages = await Promise.all(
+        pendingPages.map((page) =>
+          loadCatalogPageSource(catalogID, page, token, objectURLs)
+        )
+      );
+      catalogObjectURLsRef.current.push(...objectURLs);
+      setCatalogBook((current) => {
+        if (!current || current.id !== catalogID) {
+          revokeCatalogObjectURLs(objectURLs);
+          return current;
+        }
+        const byID = new Map(loadedPages.map((page) => [page.id, page]));
+        return {
+          ...current,
+          pages: current.pages.map((page) => byID.get(page.id) ?? page)
+        };
+      });
+      loadedCatalogChunkStartsRef.current.add(startIndex);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      loadingCatalogChunkStartsRef.current.delete(startIndex);
+      pendingPages.forEach((page) => loadingCatalogPageIDsRef.current.delete(page.id));
     }
   }
 
@@ -374,7 +579,55 @@ function App() {
   }
 
   function navigateToTab(tab: TabKey) {
-    window.location.hash = tabToHash(tab);
+    if (tab === "catalog" && catalogBook?.id) {
+      navigateToCatalog(catalogBook.id);
+      return;
+    }
+    window.history.pushState(null, "", `/${tabToHash(tab)}`);
+    const route = getRouteState(window.location);
+    setActiveTab(route.tab);
+    setCatalogRouteID(route.catalogID);
+  }
+
+  function navigateToCatalog(catalogID: number) {
+    window.history.pushState(null, "", `/catalog/${catalogID}`);
+    setActiveTab("catalog");
+    setCatalogRouteID(catalogID);
+  }
+
+  function moveCatalog(delta: -1 | 1) {
+    setCatalogTurnDirection(delta > 0 ? "forward" : "backward");
+    setCatalogPageIndex((current) => {
+      if (!catalogBook) {
+        return current;
+      }
+      if (isMobileCatalog) {
+        return clamp(current + delta, 0, catalogBook.pages.length - 1);
+      }
+      return clamp(current + delta * 2, 0, catalogBook.pages.length - 1);
+    });
+  }
+
+  function handleCatalogTouchStart(event: TouchEvent<HTMLDivElement>) {
+    catalogTouchStartXRef.current = event.changedTouches[0]?.clientX ?? null;
+  }
+
+  function handleCatalogTouchEnd(event: TouchEvent<HTMLDivElement>) {
+    const startX = catalogTouchStartXRef.current;
+    const endX = event.changedTouches[0]?.clientX ?? null;
+    catalogTouchStartXRef.current = null;
+    if (startX === null || endX === null) {
+      return;
+    }
+    const deltaX = endX - startX;
+    if (Math.abs(deltaX) < 48) {
+      return;
+    }
+    if (deltaX < 0) {
+      moveCatalog(1);
+      return;
+    }
+    moveCatalog(-1);
   }
 
   if (!token || !user) {
@@ -410,6 +663,36 @@ function App() {
     );
   }
 
+  const isCatalogFullscreen = activeTab === "catalog" && catalogRouteID !== null;
+
+  if (isCatalogFullscreen) {
+    const nextDisabled = !catalogBook || catalogPageIndex >= catalogBook.pages.length - (isMobileCatalog ? 1 : 2);
+    const prevDisabled = !catalogBook || catalogPageIndex <= 0;
+    return (
+      <main className="catalog-shell catalog-shell-reader">
+        <button
+          className="catalog-nav catalog-nav-prev"
+          onClick={() => moveCatalog(-1)}
+          disabled={prevDisabled}
+          aria-label="Previous page"
+        >
+          Prev
+        </button>
+        <div className="catalog-reader-stage" onTouchStart={handleCatalogTouchStart} onTouchEnd={handleCatalogTouchEnd}>
+          {renderCatalogStage(catalogBook, catalogPageIndex, isMobileCatalog, catalogTurnDirection)}
+        </div>
+        <button
+          className="catalog-nav catalog-nav-next"
+          onClick={() => moveCatalog(1)}
+          disabled={nextDisabled}
+          aria-label="Next page"
+        >
+          Next
+        </button>
+      </main>
+    );
+  }
+
   return (
     <main className="shell">
       <header className="topbar">
@@ -428,6 +711,7 @@ function App() {
       <nav className="tabs">
         <button className={activeTab === "drive" ? "active" : ""} onClick={() => navigateToTab("drive")}>Drive Link</button>
         <button className={activeTab === "upload" ? "active" : ""} onClick={() => navigateToTab("upload")}>Upload Files</button>
+        <button className={activeTab === "catalog" ? "active" : ""} onClick={() => navigateToTab("catalog")}>Catalog</button>
         <button className={activeTab === "history" ? "active" : ""} onClick={() => navigateToTab("history")}>History</button>
       </nav>
 
@@ -466,6 +750,9 @@ function App() {
               </button>
               <button className="ghost" onClick={handleDriveMerge} disabled={loading || !driveFiles.length}>
                 Merge by Filename Numbers
+              </button>
+              <button className="ghost" onClick={handleCreateDriveCatalog} disabled={loading || !driveFiles.length}>
+                Create Catalog
               </button>
             </div>
           </div>
@@ -542,6 +829,9 @@ function App() {
             <button onClick={handleUploadMerge} disabled={loading || !uploadFiles.length}>
               Merge Uploaded Files
             </button>
+            <button className="ghost" onClick={handleCreateUploadCatalog} disabled={loading || !uploadFiles.length}>
+              Create Catalog
+            </button>
           </div>
           <div className="panel inset">
             <h2>Upload review</h2>
@@ -585,6 +875,66 @@ function App() {
                 </tbody>
               </table>
             </div>
+          </div>
+        </section>
+      ) : null}
+
+      {activeTab === "catalog" ? (
+        <section className="catalog-layout">
+          <div className="panel catalog-sidebar">
+            <div className="stack">
+              <div>
+                <p className="eyebrow">Flip Catalog</p>
+                <h2>{catalogBook?.title ?? "Catalog"}</h2>
+                <p className="hint">
+                  {catalogBook
+                    ? `${catalogBook.sourceLabel} • ${catalogBook.pages.length} page(s)`
+                    : "Create a catalog from the Drive or Upload tab to preview it like a book."}
+                </p>
+              </div>
+              {catalogBook ? (
+                <>
+                  <div className="actions">
+                    <button
+                      className="ghost"
+                      onClick={() => setCatalogPageIndex((current) => Math.max(current - 1, 0))}
+                      disabled={catalogPageIndex === 0}
+                    >
+                      Prev
+                    </button>
+                    <button
+                      onClick={() => setCatalogPageIndex((current) => Math.min(current + 1, catalogBook.pages.length - 1))}
+                      disabled={catalogPageIndex >= catalogBook.pages.length - 1}
+                    >
+                      Next
+                    </button>
+                  </div>
+                  <div className="detail-meta">
+                    <span>Page: {catalogPageIndex + 1}/{catalogBook.pages.length}</span>
+                    <span>{catalogBook.pages[catalogPageIndex]?.title}</span>
+                  </div>
+                  <div className="panel-scroll">
+                    <ul className="catalog-page-list">
+                      {catalogBook.pages.map((page, index) => (
+                        <li key={page.id}>
+                          <button
+                            className={`catalog-page-jump${index === catalogPageIndex ? " active" : ""}`}
+                            onClick={() => setCatalogPageIndex(index)}
+                          >
+                            <strong>{index + 1}</strong>
+                            <span>{page.title}</span>
+                          </button>
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                </>
+              ) : null}
+            </div>
+          </div>
+
+          <div className="panel catalog-stage-panel">
+            {renderCatalogStage(catalogBook, catalogPageIndex, isMobileCatalog, catalogTurnDirection)}
           </div>
         </section>
       ) : null}
@@ -744,6 +1094,100 @@ function isSupportedUploadFile(name: string): boolean {
   return normalized.endsWith(".pdf") || normalized.endsWith(".png");
 }
 
+function revokeCatalogObjectURLs(urls: string[]) {
+  urls.forEach((url) => URL.revokeObjectURL(url));
+}
+
+function createCatalogBook(catalog: Catalog): CatalogBook {
+  return {
+    id: catalog.id,
+    title: catalog.title,
+    sourceLabel: catalog.sourceType === "drive" ? "Google Drive" : "Local upload",
+    pages: ensureArray(catalog.pages).map((page, index) => ({
+      id: `${page.id}`,
+      title: page.name,
+      subtitle: `Page ${index + 1}${typeof page.size === "number" ? ` • ${formatBytes(page.size)}` : ""}`,
+      source: null,
+      kind: page.mimeType.startsWith("image/") ? "image" : "document"
+    }))
+  };
+}
+
+async function loadCatalogPageSource(
+  catalogID: number,
+  page: CatalogBookPage,
+  token: string,
+  objectURLs: string[]
+): Promise<CatalogBookPage> {
+  const response = await fetch(`${apiBaseURL}/catalogs/${catalogID}/pages/${page.id}/content`, {
+    headers: {
+      Authorization: `Bearer ${token}`
+    }
+  });
+  if (!response.ok) {
+    throw new Error(await readError(response));
+  }
+  const source = URL.createObjectURL(await response.blob());
+  objectURLs.push(source);
+  return {
+    ...page,
+    source
+  };
+}
+
+function renderCatalogStage(
+  catalogBook: CatalogBook | null,
+  catalogPageIndex: number,
+  isMobileCatalog: boolean,
+  catalogTurnDirection: CatalogTurnDirection
+) {
+  if (!catalogBook) {
+    return (
+      <div className="catalog-empty catalog-empty-plain">
+        <h2>No catalog yet</h2>
+        <p>Create a catalog from the Drive or Upload tab to open the flipbook view here.</p>
+      </div>
+    );
+  }
+
+  const spreadStart = catalogPageIndex;
+  const spreadPages = isMobileCatalog
+    ? catalogBook.pages.slice(spreadStart, spreadStart + 1)
+    : catalogBook.pages.slice(spreadStart, spreadStart + 2);
+
+  return (
+    <div className="catalog-stage">
+      <div className="catalog-book" aria-live="polite">
+        <div
+          key={`${spreadStart}-${catalogTurnDirection}-${isMobileCatalog ? "mobile" : "desktop"}`}
+          className={`catalog-spread${isMobileCatalog ? " mobile" : ""}${isMobileCatalog ? "" : ` turn-${catalogTurnDirection}`}`}
+        >
+          {spreadPages.map((page, index) => (
+            <article
+              key={page.id}
+              className={`catalog-sheet catalog-sheet-static${!isMobileCatalog && index === 0 ? " verso" : ""}`}
+            >
+              <div className="catalog-sheet-face catalog-sheet-front">
+                <div className="catalog-sheet-body">
+                  {!page.source ? (
+                    <div className="catalog-page-loading">Loading page...</div>
+                  ) : page.kind === "image" ? (
+                    <img src={page.source} alt={page.title} />
+                  ) : (
+                    <object data={page.source} type="application/pdf" aria-label={page.title}>
+                      <iframe src={page.source} title={page.title} loading="lazy" />
+                    </object>
+                  )}
+                </div>
+              </div>
+            </article>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
 function formatJobProgress(job: Job, downloadSpeedBps: number | null) {
   if (job.status === "completed") {
     return "Completed.";
@@ -833,6 +1277,8 @@ function getJobFileProgress(job: Job, fileIndex: number) {
 
 function getTabFromHash(hash: string): TabKey {
   switch (hash) {
+    case "#/catalog":
+      return "catalog";
     case "#/upload":
       return "upload";
     case "#/history":
@@ -840,6 +1286,14 @@ function getTabFromHash(hash: string): TabKey {
     default:
       return "drive";
   }
+}
+
+function getRouteState(location: Location): { tab: TabKey; catalogID: number | null } {
+  const match = location.pathname.match(/^\/catalog\/(\d+)\/?$/);
+  if (match) {
+    return { tab: "catalog", catalogID: Number(match[1]) };
+  }
+  return { tab: getTabFromHash(location.hash), catalogID: null };
 }
 
 function tabToHash(tab: TabKey) {
@@ -870,6 +1324,10 @@ function formatBytes(bytes: number) {
     unitIndex += 1;
   }
   return `${size.toFixed(size >= 10 || unitIndex === 0 ? 0 : 1)} ${units[unitIndex]}`;
+}
+
+function clamp(value: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, value));
 }
 
 export default App;
