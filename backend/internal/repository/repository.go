@@ -457,6 +457,26 @@ func (r *Repository) DeleteJob(ctx context.Context, id int64) error {
 	return nil
 }
 
+func (r *Repository) DeleteCatalog(ctx context.Context, id int64) error {
+	tx, err := r.db.BeginTx(ctx, pgx.TxOptions{})
+	if err != nil {
+		return fmt.Errorf("begin delete transaction: %w", err)
+	}
+	defer tx.Rollback(ctx)
+
+	if _, err := tx.Exec(ctx, `DELETE FROM catalog_pages WHERE catalog_id = $1`, id); err != nil {
+		return fmt.Errorf("delete catalog pages: %w", err)
+	}
+	if _, err := tx.Exec(ctx, `DELETE FROM catalogs WHERE id = $1`, id); err != nil {
+		return fmt.Errorf("delete catalog: %w", err)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("commit delete transaction: %w", err)
+	}
+	return nil
+}
+
 func (r *Repository) UpdateJobFileSourceObjectKey(ctx context.Context, jobFileID int64, objectKey string) error {
 	const query = `
 		UPDATE job_files

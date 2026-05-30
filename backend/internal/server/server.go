@@ -116,8 +116,8 @@ func New(cfg config.Config, repo *repository.Repository, authSvc auth.Service, d
 	mux.Handle("/api/catalogs/drive", s.withAuth(http.HandlerFunc(s.handleDriveCatalog)))
 	mux.Handle("/api/catalogs/upload", s.withAuth(http.HandlerFunc(s.handleUploadCatalog)))
 	mux.Handle("/api/catalogs/create", s.withAuth(http.HandlerFunc(s.handleCatalogCreate)))
-	mux.Handle("/api/catalogs", s.withAuth(http.HandlerFunc(s.handleCatalogList)))
-	mux.Handle("/api/catalogs/", s.withAuth(http.HandlerFunc(s.handleCatalogByID)))
+	mux.Handle("/api/catalogs", s.withOptionalAuth(http.HandlerFunc(s.handleCatalogList)))
+	mux.Handle("/api/catalogs/", s.withOptionalAuth(http.HandlerFunc(s.handleCatalogByID)))
 	mux.Handle("/api/jobs", s.withAuth(http.HandlerFunc(s.handleJobs)))
 	mux.Handle("/api/jobs/", s.withAuth(http.HandlerFunc(s.handleJobByID)))
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, _ *http.Request) {
@@ -184,6 +184,31 @@ func (s *Server) withAuth(next http.Handler) http.Handler {
 		user, err := s.repo.GetUserByID(r.Context(), claims.UserID)
 		if err != nil {
 			writeError(w, http.StatusUnauthorized, "user not found")
+			return
+		}
+
+		ctx := context.WithValue(r.Context(), authContextKey{}, user)
+		next.ServeHTTP(w, r.WithContext(ctx))
+	})
+}
+
+func (s *Server) withOptionalAuth(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		header := r.Header.Get("Authorization")
+		if !strings.HasPrefix(header, "Bearer ") {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		claims, err := s.auth.ParseToken(strings.TrimPrefix(header, "Bearer "))
+		if err != nil {
+			next.ServeHTTP(w, r)
+			return
+		}
+
+		user, err := s.repo.GetUserByID(r.Context(), claims.UserID)
+		if err != nil {
+			next.ServeHTTP(w, r)
 			return
 		}
 
@@ -410,7 +435,7 @@ func (s *Server) handleUploadMerge(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !merge.SupportsUploadFile(header.Filename) {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF or PNG", header.Filename))
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF, PNG, or JPG", header.Filename))
 			return
 		}
 
@@ -626,7 +651,7 @@ func (s *Server) handleCatalogUpload(w http.ResponseWriter, r *http.Request, cat
 	}
 	fileHeader := fileHeaders[0]
 	if !merge.SupportsUploadFile(fileHeader.Filename) {
-		writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF or PNG", fileHeader.Filename))
+		writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF, PNG, or JPG", fileHeader.Filename))
 		return
 	}
 
@@ -764,7 +789,7 @@ func (s *Server) handleUploadCatalog(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		if !merge.SupportsUploadFile(header.Filename) {
-			writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF or PNG", header.Filename))
+			writeError(w, http.StatusBadRequest, fmt.Sprintf("%s must be a PDF, PNG, or JPG", header.Filename))
 			return
 		}
 		localPath, size, err := saveMultipartFile(workDir, header)
@@ -1162,18 +1187,66 @@ func (s *Server) handleCatalogByID(w http.ResponseWriter, r *http.Request) {
 	switch r.Method {
 	case http.MethodGet:
 		s.handleCatalogDetail(w, r, catalogID)
+	case http.MethodDelete:
+		s.handleCatalogDelete(w, r, catalogID)
 	default:
 		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
 	}
 }
 
-func (s *Server) handleCatalogDetail(w http.ResponseWriter, r *http.Request, catalogID int64) {
-	if catalog, ok := s.getCachedCatalogDetail(r.Context(), catalogID); ok {
-		if auth.CanAccessJob(currentUser(r.Context()), catalog.UserID) {
-			log.Printf("catalog_detail_cache_hit catalog_id=%d user_id=%d page_count=%d", catalogID, currentUser(r.Context()).ID, len(catalog.Pages))
-			writeJSON(w, http.StatusOK, catalog)
+func (s *Server) handleCatalogDelete(w http.ResponseWriter, r *http.Request, catalogID int64) {
+	if r.Method != http.MethodDelete {
+		writeError(w, http.StatusMethodNotAllowed, "method not allowed")
+		return
+	}
+
+	catalog, err := s.repo.GetCatalog(r.Context(), catalogID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			writeError(w, http.StatusNotFound, "catalog not found")
 			return
 		}
+		writeError(w, http.StatusInternalServerError, "failed to load catalog")
+		return
+	}
+	if !auth.CanAccessJob(currentUser(r.Context()), catalog.UserID) {
+		writeError(w, http.StatusForbidden, "forbidden")
+		return
+	}
+
+	for _, page := range catalog.Pages {
+		if page.SourceObjectKey == nil || *page.SourceObjectKey == "" {
+			continue
+		}
+		if err := s.storage.Delete(r.Context(), *page.SourceObjectKey); err != nil {
+			log.Printf("catalog=%d delete_object_failed object_key=%q err=%v", catalogID, *page.SourceObjectKey, err)
+			writeError(w, http.StatusInternalServerError, "failed to delete catalog object")
+			return
+		}
+	}
+	if s.cache != nil {
+		cacheCtx, cancel := context.WithTimeout(r.Context(), 500*time.Millisecond)
+		_ = s.cache.Delete(cacheCtx, catalogDetailCacheKey(catalogID))
+		cancel()
+	}
+	if err := s.repo.DeleteCatalog(r.Context(), catalogID); err != nil {
+		writeError(w, http.StatusInternalServerError, "failed to delete catalog")
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{"status": "deleted"})
+}
+
+func (s *Server) handleCatalogDetail(w http.ResponseWriter, r *http.Request, catalogID int64) {
+	if catalog, ok := s.getCachedCatalogDetail(r.Context(), catalogID); ok {
+		user := currentUser(r.Context())
+		if user.ID == 0 {
+			log.Printf("catalog_detail_cache_hit catalog_id=%d public page_count=%d", catalogID, len(catalog.Pages))
+		} else {
+			log.Printf("catalog_detail_cache_hit catalog_id=%d user_id=%d page_count=%d", catalogID, user.ID, len(catalog.Pages))
+		}
+		writeJSON(w, http.StatusOK, catalog)
+		return
 	}
 
 	catalog, err := s.repo.GetCatalog(r.Context(), catalogID)
@@ -1187,13 +1260,13 @@ func (s *Server) handleCatalogDetail(w http.ResponseWriter, r *http.Request, cat
 		writeError(w, http.StatusInternalServerError, "failed to load catalog")
 		return
 	}
-	if !auth.CanAccessJob(currentUser(r.Context()), catalog.UserID) {
-		log.Printf("catalog_detail_forbidden catalog_id=%d actor_user_id=%d owner_user_id=%d", catalogID, currentUser(r.Context()).ID, catalog.UserID)
-		writeError(w, http.StatusForbidden, "forbidden")
-		return
-	}
+	user := currentUser(r.Context())
 	s.cacheCatalogDetail(r.Context(), catalog)
-	log.Printf("catalog_detail_loaded catalog_id=%d user_id=%d page_count=%d source_type=%s", catalogID, currentUser(r.Context()).ID, len(catalog.Pages), catalog.SourceType)
+	if user.ID == 0 {
+		log.Printf("catalog_detail_loaded catalog_id=%d public page_count=%d source_type=%s", catalogID, len(catalog.Pages), catalog.SourceType)
+	} else {
+		log.Printf("catalog_detail_loaded catalog_id=%d user_id=%d page_count=%d source_type=%s", catalogID, user.ID, len(catalog.Pages), catalog.SourceType)
+	}
 
 	writeJSON(w, http.StatusOK, catalog)
 }
@@ -1204,9 +1277,15 @@ func (s *Server) handleCatalogList(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	catalogs, err := s.repo.ListCatalogs(r.Context(), currentUser(r.Context()))
+	user := currentUser(r.Context())
+	actor := user
+	if actor.ID == 0 {
+		actor = model.User{Role: model.RoleAdmin}
+	}
+
+	catalogs, err := s.repo.ListCatalogs(r.Context(), actor)
 	if err != nil {
-		log.Printf("catalogs_list_failed user_id=%d err=%v", currentUser(r.Context()).ID, err)
+		log.Printf("catalogs_list_failed user_id=%d err=%v", user.ID, err)
 		writeError(w, http.StatusInternalServerError, "failed to list catalogs")
 		return
 	}
@@ -1224,11 +1303,6 @@ func (s *Server) handleCatalogPageContent(w http.ResponseWriter, r *http.Request
 		}
 		log.Printf("catalog_page_catalog_load_failed catalog_id=%d page_id=%d user_id=%d err=%v", catalogID, pageID, currentUser(r.Context()).ID, err)
 		writeError(w, http.StatusInternalServerError, "failed to load catalog")
-		return
-	}
-	if !auth.CanAccessJob(currentUser(r.Context()), catalog.UserID) {
-		log.Printf("catalog_page_forbidden catalog_id=%d page_id=%d actor_user_id=%d owner_user_id=%d", catalogID, pageID, currentUser(r.Context()).ID, catalog.UserID)
-		writeError(w, http.StatusForbidden, "forbidden")
 		return
 	}
 
@@ -1926,7 +2000,12 @@ func (r *progressReader) Read(p []byte) (int, error) {
 }
 
 func currentUser(ctx context.Context) model.User {
-	return ctx.Value(authContextKey{}).(model.User)
+	if value := ctx.Value(authContextKey{}); value != nil {
+		if user, ok := value.(model.User); ok {
+			return user
+		}
+	}
+	return model.User{}
 }
 
 func writeJSON(w http.ResponseWriter, status int, payload any) {

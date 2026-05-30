@@ -4,7 +4,7 @@ import type { Catalog, CatalogPage, DrivePreviewFile, Job, UploadReviewFile, Use
 const apiBaseURL = import.meta.env.VITE_API_BASE_URL ?? "http://localhost:8080/api";
 const tokenStorageKey = "merge-pdf-token";
 type TabKey = "drive" | "upload" | "history" | "catalog";
-const uploadAccept = "application/pdf,image/png,.pdf,.png";
+const uploadAccept = "application/pdf,image/png,image/jpeg,.pdf,.png,.jpg,.jpeg";
 const catalogChunkSize = 3;
 
 type CatalogBookPage = {
@@ -138,11 +138,11 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!token || !catalogRouteID) {
+    if (!catalogRouteID) {
       return;
     }
     void loadCatalog(catalogRouteID);
-  }, [token, catalogRouteID]);
+  }, [catalogRouteID]);
 
   useEffect(() => {
     if (!token || !catalogBook) {
@@ -304,7 +304,7 @@ function App() {
     }
   }
 
-  function replaceCatalog(nextCatalog: CatalogBook, objectURLs: string[] = []) {
+  function replaceCatalog(nextCatalog: CatalogBook | null, objectURLs: string[] = []) {
     revokeCatalogObjectURLs(catalogObjectURLsRef.current);
     catalogObjectURLsRef.current = objectURLs;
     loadingCatalogPageIDsRef.current.clear();
@@ -398,7 +398,7 @@ function App() {
 
   async function loadCatalog(catalogID: number) {
     try {
-      const catalog = await api<Catalog>(`/catalogs/${catalogID}`, { token });
+      const catalog = await api<Catalog>(`/catalogs/${catalogID}`, token ? { token } : {});
       replaceCatalog(createCatalogBook(catalog));
     } catch (err) {
       setError(getErrorMessage(err));
@@ -453,10 +453,39 @@ function App() {
     }
   }
 
-  async function loadCatalogChunk(catalogID: number, startIndex: number) {
+  async function handleDeleteCatalog(catalogID: number) {
     if (!token) {
+      setError("Sign in to delete catalogs.");
       return;
     }
+
+    setLoading(true);
+    setError("");
+    try {
+      const response = await fetch(`${apiBaseURL}/catalogs/${catalogID}`, {
+        method: "DELETE",
+        headers: {
+          Authorization: `Bearer ${token}`
+        }
+      });
+      if (!response.ok) {
+        throw new Error(await readError(response));
+      }
+
+      setCatalogs((current) => current.filter((catalog) => catalog.id !== catalogID));
+      setSelectedCatalogID((current) => (current === catalogID ? null : current));
+      if (catalogBook?.id === catalogID) {
+        replaceCatalog(null);
+      }
+      setNotice(`Catalog ${catalogID} deleted.`);
+    } catch (err) {
+      setError(getErrorMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  async function loadCatalogChunk(catalogID: number, startIndex: number) {
     if (loadedCatalogChunkStartsRef.current.has(startIndex) || loadingCatalogChunkStartsRef.current.has(startIndex)) {
       return;
     }
@@ -704,6 +733,36 @@ function App() {
     moveCatalog(-1);
   }
 
+  const isCatalogFullscreen = activeTab === "catalog" && catalogRouteID !== null;
+
+  if (isCatalogFullscreen) {
+    const nextDisabled = !catalogBook || catalogPageIndex >= catalogBook.pages.length - (isMobileCatalog ? 1 : 2);
+    const prevDisabled = !catalogBook || catalogPageIndex <= 0;
+    return (
+      <main className="catalog-shell catalog-shell-reader">
+        <button
+          className="catalog-nav catalog-nav-prev"
+          onClick={() => moveCatalog(-1)}
+          disabled={prevDisabled}
+          aria-label="Previous page"
+        >
+          Prev
+        </button>
+        <div className="catalog-reader-stage" onTouchStart={handleCatalogTouchStart} onTouchEnd={handleCatalogTouchEnd}>
+          {renderCatalogStage(catalogBook, catalogPageIndex, isMobileCatalog, catalogTurnDirection)}
+        </div>
+        <button
+          className="catalog-nav catalog-nav-next"
+          onClick={() => moveCatalog(1)}
+          disabled={nextDisabled}
+          aria-label="Next page"
+        >
+          Next
+        </button>
+      </main>
+    );
+  }
+
   if (!token || !user) {
     return (
       <main className="shell shell-login">
@@ -733,36 +792,6 @@ function App() {
           {error ? <p className="feedback error">{error}</p> : null}
           {notice ? <p className="feedback success">{notice}</p> : null}
         </section>
-      </main>
-    );
-  }
-
-  const isCatalogFullscreen = activeTab === "catalog" && catalogRouteID !== null;
-
-  if (isCatalogFullscreen) {
-    const nextDisabled = !catalogBook || catalogPageIndex >= catalogBook.pages.length - (isMobileCatalog ? 1 : 2);
-    const prevDisabled = !catalogBook || catalogPageIndex <= 0;
-    return (
-      <main className="catalog-shell catalog-shell-reader">
-        <button
-          className="catalog-nav catalog-nav-prev"
-          onClick={() => moveCatalog(-1)}
-          disabled={prevDisabled}
-          aria-label="Previous page"
-        >
-          Prev
-        </button>
-        <div className="catalog-reader-stage" onTouchStart={handleCatalogTouchStart} onTouchEnd={handleCatalogTouchEnd}>
-          {renderCatalogStage(catalogBook, catalogPageIndex, isMobileCatalog, catalogTurnDirection)}
-        </div>
-        <button
-          className="catalog-nav catalog-nav-next"
-          onClick={() => moveCatalog(1)}
-          disabled={nextDisabled}
-          aria-label="Next page"
-        >
-          Next
-        </button>
       </main>
     );
   }
@@ -892,11 +921,11 @@ function App() {
         <section className="panel grid">
           <div className="stack">
             <label className="upload-dropzone">
-              <span className="upload-dropzone-title">Choose PDF or PNG files</span>
-              <span className="upload-dropzone-copy">Pick one or more PDFs or PNGs, then keep adding more if needed.</span>
+              <span className="upload-dropzone-title">Choose PDF, PNG, or JPG files</span>
+              <span className="upload-dropzone-copy">Pick one or more PDFs, PNGs, or JPGs, then keep adding more if needed.</span>
               <span className="upload-dropzone-button">Browse files</span>
               <span className="upload-dropzone-meta">
-                {uploadFiles.length ? `${uploadFiles.length} file(s) prepared` : "PDF + PNG"}
+                {uploadFiles.length ? `${uploadFiles.length} file(s) prepared` : "PDF + PNG + JPG"}
               </span>
               <input type="file" accept={uploadAccept} multiple onChange={onFilesSelected} />
             </label>
@@ -922,6 +951,15 @@ function App() {
                 ))}
               </select>
             </div>
+            {selectedCatalogID ? (
+              <button
+                className="ghost danger"
+                onClick={() => handleDeleteCatalog(selectedCatalogID)}
+                disabled={loading}
+              >
+                Delete Selected Catalog
+              </button>
+            ) : null}
             <button className="ghost" onClick={handleUploadToCatalog} disabled={loading || !uploadFiles.length || !catalogs.length}>
               Upload to Selected Catalog
             </button>
@@ -1184,7 +1222,7 @@ function ensureArray<T>(value: T[] | null | undefined): T[] {
 
 function isSupportedUploadFile(name: string): boolean {
   const normalized = name.toLowerCase();
-  return normalized.endsWith(".pdf") || normalized.endsWith(".png");
+  return normalized.endsWith(".pdf") || normalized.endsWith(".png") || normalized.endsWith(".jpg") || normalized.endsWith(".jpeg");
 }
 
 function revokeCatalogObjectURLs(urls: string[]) {
@@ -1212,10 +1250,12 @@ async function loadCatalogPageSource(
   token: string,
   objectURLs: string[]
 ): Promise<CatalogBookPage> {
+  const headers = new Headers();
+  if (token) {
+    headers.set("Authorization", `Bearer ${token}`);
+  }
   const response = await fetch(`${apiBaseURL}/catalogs/${catalogID}/pages/${page.id}/content`, {
-    headers: {
-      Authorization: `Bearer ${token}`
-    }
+    headers
   });
   if (!response.ok) {
     throw new Error(await readError(response));

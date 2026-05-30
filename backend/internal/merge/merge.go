@@ -17,6 +17,8 @@ const mergeBatchSize = 3
 var supportedUploadExtensions = map[string]struct{}{
 	".pdf": {},
 	".png": {},
+	".jpg": {},
+	".jpeg": {},
 }
 
 // SortInputs keeps merge order deterministic when users or Drive provide duplicate positions.
@@ -95,6 +97,12 @@ func NormalizeUploadInput(workDir, localPath string) (string, error) {
 		outputPath := filepath.Join(workDir, strings.TrimSuffix(filepath.Base(localPath), filepath.Ext(localPath))+"-image.pdf")
 		if err := pdfapi.ImportImagesFile([]string{localPath}, outputPath, nil, nil); err != nil {
 			return "", fmt.Errorf("convert png to pdf: %w", err)
+		}
+		return outputPath, nil
+	case ".jpg", ".jpeg":
+		outputPath := filepath.Join(workDir, strings.TrimSuffix(filepath.Base(localPath), filepath.Ext(localPath))+"-image.pdf")
+		if err := pdfapi.ImportImagesFile([]string{localPath}, outputPath, nil, nil); err != nil {
+			return "", fmt.Errorf("convert jpg to pdf: %w", err)
 		}
 		return outputPath, nil
 	default:

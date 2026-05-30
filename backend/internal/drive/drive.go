@@ -90,6 +90,7 @@ type driveListResponse struct {
 var supportedDriveMimeTypes = map[string]struct{}{
 	"application/pdf": {},
 	"image/png":       {},
+	"image/jpeg":      {},
 }
 
 // PreviewFolder lists direct supported children for a shared Drive folder and pre-sorts them for merge.
@@ -151,7 +152,7 @@ func (c Client) PreviewFolder(ctx context.Context, folderURL string) ([]model.Dr
 	}
 
 	if len(files) == 0 {
-		return nil, fmt.Errorf("no supported PDF or PNG files found in the provided folder")
+		return nil, fmt.Errorf("no supported PDF, PNG, or JPG files found in the provided folder")
 	}
 
 	sort.Slice(files, func(i, j int) bool {
