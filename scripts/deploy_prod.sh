@@ -40,7 +40,7 @@ require_vars() {
   local missing=()
   local required=(
     APP_URL
-    CLOUDFLARE_TUNNEL_TOKEN
+    CLOUDFLARED_DIR
     JWT_SECRET
     POSTGRES_PASSWORD
     MINIO_ROOT_PASSWORD
@@ -54,6 +54,24 @@ require_vars() {
 
   if (( ${#missing[@]} > 0 )); then
     echo "Missing required env vars in $ENV_FILE: ${missing[*]}" >&2
+    exit 1
+  fi
+}
+
+require_cloudflared_config() {
+  local config_dir config_file
+
+  config_dir="${CLOUDFLARED_DIR}"
+  config_file="${config_dir%/}/config.yml"
+
+  if [[ ! -d "$config_dir" ]]; then
+    echo "Missing Cloudflare directory: $config_dir" >&2
+    exit 1
+  fi
+
+  if [[ ! -f "$config_file" ]]; then
+    echo "Missing Cloudflare config file: $config_file" >&2
+    echo "See cloudflared/config.example.yml for the expected structure." >&2
     exit 1
   fi
 }
@@ -102,6 +120,7 @@ run_migrations() {
 cmd_up() {
   load_env
   require_vars
+  require_cloudflared_config
   "${COMPOSE_CMD[@]}" up -d --build
   wait_for_postgres
   run_migrations

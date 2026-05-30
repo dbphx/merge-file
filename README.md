@@ -53,25 +53,44 @@ docker compose up -d --build
 
 ## Production via Cloudflare Tunnel
 
-Use [docker-compose.prod.yml](docker-compose.prod.yml) when you want a single public app domain fronted by Cloudflare Tunnel.
+Use [docker-compose.prod.yml](docker-compose.prod.yml) when you want a production stack fronted by Cloudflare Tunnel in the same pattern as the CRM repo: `cloudflared -> nginx -> frontend/backend`.
 
 The production stack is arranged like this:
 
-- `cloudflared` exposes one hostname to Cloudflare
-- `frontend` serves the SPA and proxies `/api/*` to `backend`
+- `cloudflared` reads `/etc/cloudflared/config.yml` from a host-mounted directory
+- `nginx` is the public reverse proxy inside Docker
+- `frontend` serves the SPA only
+- `nginx` proxies `/api/*` to `backend`
 - `backend` talks to `postgres`, `minio`, and `redis` only on the internal Docker network
-- no container ports are published to the host
+- only `nginx:80` and the local-only MinIO console are published to the host
 
 1. Copy `.env.example` to a prod env file and set these values:
 
 - `APP_URL=https://your-app-domain.example.com`
-- `CLOUDFLARE_TUNNEL_TOKEN=...`
+- `CLOUDFLARED_DIR=/root/.cloudflared`
 - `JWT_SECRET=...`
 - `GOOGLE_DRIVE_API_KEY=...`
 - `MINIO_ROOT_PASSWORD=...`
 - `POSTGRES_PASSWORD=...`
 
-2. Create a Cloudflare Tunnel in the Cloudflare dashboard and assign your public hostname to the tunnel. The tunnel token from that setup goes into `CLOUDFLARE_TUNNEL_TOKEN`.
+2. Prepare the Cloudflare tunnel config directory on the host:
+
+- create the tunnel in Cloudflare
+- put the tunnel credentials JSON into `CLOUDFLARED_DIR`
+- create `config.yml` in that same directory
+- use [cloudflared/config.example.yml](cloudflared/config.example.yml) as the template
+
+Minimal example:
+
+```yaml
+tunnel: your-tunnel-id
+credentials-file: /etc/cloudflared/your-tunnel-id.json
+
+ingress:
+  - hostname: app.your-domain.example.com
+    service: http://nginx:80
+  - service: http_status:404
+```
 
 3. Start the production stack:
 
@@ -93,6 +112,7 @@ The deploy script will:
 - wait for `postgres` to become healthy
 - apply migrations `002` through `006`
 - print the final service status
+- fail early if `${CLOUDFLARED_DIR}/config.yml` is missing
 
 4. If you prefer to run without the script, and this is not a fresh Postgres volume, apply the migrations before using the app:
 
@@ -106,8 +126,9 @@ psql postgres://mergepdf:mergepdf@localhost:5432/mergepdf -f migrations/006_add_
 
 Notes:
 
-- frontend calls the API through `/api`, so only `APP_URL` needs to be public
-- [frontend/nginx.prod.conf](frontend/nginx.prod.conf) is the reverse-proxy entrypoint used by the prod compose file
+- frontend calls the API through `/api`, so the public tunnel only needs to target `nginx`
+- [nginx/prod.conf](nginx/prod.conf) is the reverse-proxy entrypoint used by the prod compose file
+- [cloudflared/config.example.yml](cloudflared/config.example.yml) shows the expected Cloudflare tunnel config shape
 - [scripts/deploy_prod.sh](scripts/deploy_prod.sh) also supports `down`, `restart`, `logs`, and `ps`
 - if you want a clean production database, remove the persisted volumes first:
 
