@@ -145,7 +145,7 @@ function App() {
   }, [catalogRouteID]);
 
   useEffect(() => {
-    if (!token || !catalogBook) {
+    if (!catalogBook) {
       return;
     }
 
